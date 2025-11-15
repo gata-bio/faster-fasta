@@ -1,7 +1,7 @@
 # Faster FASTA
 
 Faster FASTA is a collection of command-line utilities for processing memory-mapped plain-text FASTA files.
-It leverages StringZilla to provide high-performance functionality for:
+It's implemented in Rust with StringZilla to provide high-performance functionality for:
 
 - deduplication via `fasta-dedup`
 - sorting sequences via `fasta-sort`
@@ -12,3 +12,13 @@ It leverages StringZilla to provide high-performance functionality for:
 - transliterating from DNA to RNA via `fasta-dna2rna`
 - format line wrapping via `fasta-wrap`
 - sample sequences randomly via `fasta-sample`
+
+Deduplication is implemented using StringZilla's hash-function populating a flat hash-set, and checking for collisions of subsequent sequences with previously seen ones.
+Transliteration and reverse-complementation are implemented using StringZilla's SIMD-accelerated byte-mapping functions.
+Sorting is implemented using StringZilla's built-in sort for byte-strings.
+
+## Quick Start
+
+```bash
+cargo install --git https://github.com/gata-bio/faster-fasta
+```

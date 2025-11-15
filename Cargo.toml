@@ -1,0 +1,30 @@
+[package]
+name = "faster-fasta"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ash Vardanian <1983160+ashvardanian@users.noreply.github.com>"]
+description = "Command-line utilities for processing memory-mapped plain-text FASTA files"
+readme = "README.md"
+license = "Apache-2.0"
+keywords = ["bioinformatics", "fasta", "cli", "sequence-analysis"]
+categories = ["command-line-utilities", "science"]
+repository = "https://github.com/ashvardanian/faster-fasta"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] } # CLI argument parsing
+memmap2 = "0.9" # Memory-mapped file I/O
+stringzilla = "4.2.3"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[profile.release]
+lto = true              # Link-time optimization
+codegen-units = 1       # Better optimization, slower compile
+opt-level = 3           # Maximum optimization
+strip = true            # Strip symbols for smaller binary
+
+# Binary targets
+[[bin]]
+name = "fasta-dedup"
+path = "src/bin/fasta-dedup.rs"

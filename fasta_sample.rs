@@ -1,4 +1,20 @@
 //! FASTA sequence sampling utility
+//!
+//! Randomly sample sequences using reservoir sampling (Algorithm R).
+//! Fixed memory usage regardless of input size.
+//!
+//! **Memory**: O(k) - only stores sampled sequences
+//! **Streaming**: Yes - reservoir sampling, no materialization
+//!
+//! # Examples
+//!
+//! ```bash
+//! # Sample 1000 sequences
+//! fasta-sample sequences.fasta --count 1000 -o sample.fasta
+//!
+//! # Sample 10% with seed for reproducibility
+//! cat sequences.fasta | fasta-sample --fraction 0.1 --seed 42 > sample.fasta
+//! ```
 
 use std::io::{self, Write};
 use std::process;

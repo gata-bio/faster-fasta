@@ -1,4 +1,20 @@
 //! FASTA sequence deduplication utility
+//!
+//! Remove duplicate sequences, keeping first occurrence.
+//! Uses StringZilla's `hash()` for SIMD-accelerated hashing.
+//!
+//! **Memory**: O(n) - stores all unique sequences in HashSet
+//! **Streaming**: No - materializes HashSet in memory
+//!
+//! # Examples
+//!
+//! ```bash
+//! # From file
+//! fasta-dedup sequences.fasta -o unique.fasta
+//!
+//! # From stdin
+//! cat sequences.fasta | fasta-dedup > unique.fasta
+//! ```
 
 use std::collections::HashSet;
 use std::io::{self, Write};

@@ -1,4 +1,26 @@
 //! FASTA sequence sorting utility
+//!
+//! Sort sequences by name (header), sequence content, or length.
+//! Uses StringZilla's `argsort_permutation_by()` for SIMD-accelerated string sorting.
+//!
+//! **Memory**: O(n) - loads all entries for sorting
+//! **Streaming**: No - sorting requires all data in memory
+//!
+//! # Examples
+//!
+//! ```bash
+//! # Sort by header name (default)
+//! fasta-sort sequences.fasta -o sorted.fasta
+//!
+//! # Sort by sequence content
+//! fasta-sort --sequence sequences.fasta -o sorted.fasta
+//!
+//! # Sort by length (shortest first)
+//! fasta-sort --length sequences.fasta -o sorted.fasta
+//!
+//! # Reverse sort by length (longest first)
+//! cat sequences.fasta | fasta-sort -l -r > sorted.fasta
+//! ```
 
 use std::io::{self, Write};
 use std::process;

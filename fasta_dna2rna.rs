@@ -1,4 +1,20 @@
 //! FASTA DNA to RNA conversion utility
+//!
+//! Convert DNA sequences to RNA (T→U).
+//! Uses StringZilla's `lookup()` for SIMD-accelerated character mapping.
+//!
+//! **Memory**: O(1) - processes one sequence at a time
+//! **Streaming**: Yes - constant memory usage
+//!
+//! # Examples
+//!
+//! ```bash
+//! # From file
+//! fasta-dna2rna sequences.fasta -o rna.fasta
+//!
+//! # From stdin
+//! cat dna.fasta | fasta-dna2rna > rna.fasta
+//! ```
 
 use std::io::{self, Write};
 use std::process;

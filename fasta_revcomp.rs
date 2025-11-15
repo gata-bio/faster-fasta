@@ -1,4 +1,21 @@
 //! FASTA reverse complement utility
+//!
+//! Compute reverse complement of DNA sequences.
+//! Uses StringZilla's `lookup()` for SIMD-accelerated nucleotide translation.
+//! Supports standard and ambiguous IUPAC codes.
+//!
+//! **Memory**: O(1) - processes one sequence at a time
+//! **Streaming**: Yes - constant memory usage
+//!
+//! # Examples
+//!
+//! ```bash
+//! # From file
+//! fasta-revcomp sequences.fasta -o revcomp.fasta
+//!
+//! # Pipe composition
+//! cat sequences.fasta | fasta-revcomp | fasta-sort > sorted_revcomp.fasta
+//! ```
 
 use std::io::{self, Write};
 use std::process;

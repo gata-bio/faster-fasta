@@ -26,4 +26,20 @@ strip = true            # Strip symbols for smaller binary
 
 [[bin]]
 name = "fasta-dedup"
-path = "fasta-dedup.rs"
+path = "fasta_dedup.rs"
+
+[[bin]]
+name = "fasta-sample"
+path = "fasta_sample.rs"
+
+[[bin]]
+name = "fasta-sort"
+path = "fasta_sort.rs"
+
+[[bin]]
+name = "fasta-revcomp"
+path = "fasta_revcomp.rs"
+
+[[bin]]
+name = "fasta-dna2rna"
+path = "fasta_dna2rna.rs"

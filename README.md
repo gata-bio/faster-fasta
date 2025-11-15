@@ -4,14 +4,14 @@ Faster FASTA is a collection of command-line utilities for processing memory-map
 It's implemented in Rust with StringZilla to provide high-performance functionality for:
 
 - deduplication via `fasta-dedup`
+- sample sequences randomly via `fasta-sample`
 - sorting sequences via `fasta-sort`
-- filtering sequences by length via `fasta-filter-length`
-- extracting sequences by ID via `fasta-extract-ids`
-- merging FASTA files via `fasta-merge`
 - reversing and complementing sequences via `fasta-revcomp`
 - transliterating from DNA to RNA via `fasta-dna2rna`
+- merging FASTA files via `fasta-merge`
 - format line wrapping via `fasta-wrap`
-- sample sequences randomly via `fasta-sample`
+- filtering sequences by length via `fasta-filter-length`
+- extracting sequences by ID via `fasta-extract-ids`
 
 Deduplication is implemented using StringZilla's hash-function populating a flat hash-set, and checking for collisions of subsequent sequences with previously seen ones.
 Transliteration and reverse-complementation are implemented using StringZilla's SIMD-accelerated byte-mapping functions.

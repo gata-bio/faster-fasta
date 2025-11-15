@@ -24,7 +24,6 @@ codegen-units = 1       # Better optimization, slower compile
 opt-level = 3           # Maximum optimization
 strip = true            # Strip symbols for smaller binary
 
-# Binary targets
 [[bin]]
 name = "fasta-dedup"
-path = "src/bin/fasta-dedup.rs"
+path = "fasta-dedup.rs"

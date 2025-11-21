@@ -1,7 +1,8 @@
-//! FASTA DNA to RNA conversion utility
+//! DNA to RNA conversion utility for FASTA and FASTQ files
 //!
 //! Convert DNA sequences to RNA (T→U).
 //! Uses StringZilla's `lookup()` for SIMD-accelerated character mapping.
+//! Auto-detects format and preserves it (FASTQ quality scores are preserved).
 //!
 //! **Memory**: O(1) - processes one sequence at a time
 //! **Streaming**: Yes - constant memory usage
@@ -9,8 +10,11 @@
 //! # Examples
 //!
 //! ```bash
-//! # From file
+//! # Convert FASTA
 //! fasta-dna2rna sequences.fasta -o rna.fasta
+//!
+//! # Convert FASTQ (quality preserved)
+//! fasta-dna2rna reads.fastq -o rna.fastq
 //!
 //! # From stdin
 //! cat dna.fasta | fasta-dna2rna > rna.fasta
@@ -22,14 +26,17 @@ use std::process;
 use clap::Parser;
 use stringzilla::sz::lookup;
 
-mod faster_fasta;
-use faster_fasta::*;
+mod shared;
+use shared::*;
 
-/// Convert DNA sequences to RNA
+/// Convert DNA sequences to RNA (FASTA or FASTQ)
 ///
-/// Converts T (thymine) to U (uracil) using StringZilla's translate() function.
+/// Converts T (thymine) to U (uracil) using StringZilla's lookup() function.
 /// Handles both uppercase and lowercase bases.
+/// Auto-detects format and preserves it (FASTQ quality scores are preserved).
 pub fn fasta_dna2rna(input: &[u8], mut output: impl Write) -> io::Result<()> {
+    let format = detect_format(input)?;
+
     // StringZilla translation table for DNA -> RNA
     let mut table = [0u8; 256];
     for i in 0..256 {
@@ -39,19 +46,35 @@ pub fn fasta_dna2rna(input: &[u8], mut output: impl Write) -> io::Result<()> {
     table[b'T' as usize] = b'U';
     table[b't' as usize] = b'u';
 
-    let parser = FastaParser::new(input);
+    match format {
+        SeqFormat::Fasta => {
+            let parser = FastaParser::new(input);
+            for entry in parser {
+                let seq = entry.sequence.as_bytes();
+                let mut rna = vec![0u8; seq.len()];
+                lookup(&mut rna, seq, table);
 
-    for entry in parser {
-        let seq = entry.sequence.as_bytes();
-        let mut rna = vec![0u8; seq.len()];
+                output.write_all(entry.header)?;
+                output.write_all(b"\n")?;
+                output.write_all(&rna)?;
+                output.write_all(b"\n")?;
+            }
+        }
+        SeqFormat::Fastq => {
+            let parser = FastqParser::new(input);
+            for entry in parser {
+                let seq = entry.sequence.as_bytes();
+                let mut rna = vec![0u8; seq.len()];
+                lookup(&mut rna, seq, table);
 
-        // Use StringZilla lookup for DNA -> RNA conversion
-        lookup(&mut rna, seq, table);
-
-        output.write_all(entry.header)?;
-        output.write_all(b"\n")?;
-        output.write_all(&rna)?;
-        output.write_all(b"\n")?;
+                output.write_all(entry.header)?;
+                output.write_all(b"\n")?;
+                output.write_all(&rna)?;
+                output.write_all(b"\n+\n")?;
+                output.write_all(entry.quality)?;
+                output.write_all(b"\n")?;
+            }
+        }
     }
 
     output.flush()?;
@@ -61,12 +84,15 @@ pub fn fasta_dna2rna(input: &[u8], mut output: impl Write) -> io::Result<()> {
 /// Convert DNA sequences to RNA (T -> U)
 #[derive(Parser)]
 #[command(name = "fasta-dna2rna")]
-#[command(version, about, long_about = None)]
+#[command(version, about = "Convert DNA to RNA (T→U)")]
+#[command(
+    long_about = "Convert DNA sequences to RNA from FASTA or FASTQ files.\nAuto-detects format and preserves it (FASTQ quality scores are preserved).\nUses SIMD-accelerated character mapping."
+)]
 struct Args {
-    /// Input FASTA file (use '-' or omit for stdin)
+    /// Input file (FASTA or FASTQ, use '-' or omit for stdin)
     input: Option<String>,
 
-    /// Output FASTA file (use '-' or omit for stdout)
+    /// Output file (use '-' or omit for stdout)
     #[arg(short, long)]
     output: Option<String>,
 }
@@ -94,7 +120,7 @@ fn main() {
         if e.kind() == io::ErrorKind::BrokenPipe {
             process::exit(0);
         }
-        eprintln!("Error processing FASTA: {}", e);
+        eprintln!("Error processing sequences: {}", e);
         process::exit(1);
     }
 }
@@ -154,5 +180,19 @@ mod tests {
         let lines: Vec<&str> = result.lines().collect();
         assert_eq!(lines[1], "AUGC");
         assert_eq!(lines[3], "UUAA");
+    }
+
+    #[test]
+    fn test_fastq_dna2rna() {
+        let data = b"@seq1\nATGC\n+\nIIII\n@seq2\nTTAA\n+\nHHHH\n";
+        let mut output = Vec::new();
+        fasta_dna2rna(data, &mut output).unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        assert!(result.contains("AUGC"));
+        assert!(result.contains("UUAA"));
+        // Verify quality is preserved
+        assert!(result.contains("IIII"));
+        assert!(result.contains("HHHH"));
     }
 }

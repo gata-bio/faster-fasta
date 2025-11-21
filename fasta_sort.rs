@@ -1,7 +1,8 @@
-//! FASTA sequence sorting utility
+//! Sequence sorting utility for FASTA and FASTQ files
 //!
 //! Sort sequences by name (header), sequence content, or length.
 //! Uses StringZilla's `argsort_permutation_by()` for SIMD-accelerated string sorting.
+//! Auto-detects format and preserves it in output.
 //!
 //! **Memory**: O(n) - loads all entries for sorting
 //! **Streaming**: No - sorting requires all data in memory
@@ -9,11 +10,11 @@
 //! # Examples
 //!
 //! ```bash
-//! # Sort by header name (default)
+//! # Sort FASTA by header name (default)
 //! fasta-sort sequences.fasta -o sorted.fasta
 //!
-//! # Sort by sequence content
-//! fasta-sort --sequence sequences.fasta -o sorted.fasta
+//! # Sort FASTQ by sequence content
+//! fasta-sort --sequence reads.fastq -o sorted.fastq
 //!
 //! # Sort by length (shortest first)
 //! fasta-sort --length sequences.fasta -o sorted.fasta
@@ -28,10 +29,10 @@ use std::process;
 use clap::Parser;
 use stringzilla::sz::{argsort_permutation_by, SortedIdx};
 
-mod faster_fasta;
-use faster_fasta::*;
+mod shared;
+use shared::*;
 
-/// Sort criterion for FASTA sequences
+/// Sort criterion for sequences
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SortBy {
     Name,
@@ -39,19 +40,66 @@ pub enum SortBy {
     Length,
 }
 
-/// Sort FASTA sequences
+/// Stored entry for sorting (supports both FASTA and FASTQ)
+enum StoredEntry {
+    Fasta {
+        header: Vec<u8>,
+        sequence: Vec<u8>,
+    },
+    Fastq {
+        header: Vec<u8>,
+        sequence: Vec<u8>,
+        quality: Vec<u8>,
+    },
+}
+
+impl StoredEntry {
+    fn header(&self) -> &[u8] {
+        match self {
+            StoredEntry::Fasta { header, .. } => header,
+            StoredEntry::Fastq { header, .. } => header,
+        }
+    }
+
+    fn sequence(&self) -> &[u8] {
+        match self {
+            StoredEntry::Fasta { sequence, .. } => sequence,
+            StoredEntry::Fastq { sequence, .. } => sequence,
+        }
+    }
+}
+
+/// Sort sequences (FASTA or FASTQ)
 ///
 /// Sorts sequences by name (header), sequence content, or length.
 /// Uses StringZilla's argsort_permutation_by() for string sorting.
+/// Auto-detects format and preserves it in output.
 pub fn fasta_sort(
     input: &[u8],
     mut output: impl Write,
     sort_by: SortBy,
     reverse: bool,
 ) -> io::Result<()> {
-    let entries: Vec<_> = FastaParser::new(input).collect();
-    let count = entries.len();
+    let format = detect_format(input)?;
 
+    // Materialize all entries
+    let entries: Vec<StoredEntry> = match format {
+        SeqFormat::Fasta => FastaParser::new(input)
+            .map(|e| StoredEntry::Fasta {
+                header: e.header.to_vec(),
+                sequence: e.sequence.as_bytes().to_vec(),
+            })
+            .collect(),
+        SeqFormat::Fastq => FastqParser::new(input)
+            .map(|e| StoredEntry::Fastq {
+                header: e.header.to_vec(),
+                sequence: e.sequence.as_bytes().to_vec(),
+                quality: e.quality.to_vec(),
+            })
+            .collect(),
+    };
+
+    let count = entries.len();
     if count == 0 {
         return Ok(());
     }
@@ -65,8 +113,8 @@ pub fn fasta_sort(
                 order[i] = i;
             }
             order.sort_by(|&a, &b| {
-                let len_a = entries[a].sequence.as_bytes().len();
-                let len_b = entries[b].sequence.as_bytes().len();
+                let len_a = entries[a].sequence().len();
+                let len_b = entries[b].sequence().len();
                 if reverse {
                     len_b.cmp(&len_a)
                 } else {
@@ -78,8 +126,8 @@ pub fn fasta_sort(
             // Use StringZilla for string sorting
             let mapper = |idx: usize| -> &[u8] {
                 match sort_by {
-                    SortBy::Name => entries[idx].header,
-                    SortBy::Sequence => entries[idx].sequence.as_bytes(),
+                    SortBy::Name => entries[idx].header(),
+                    SortBy::Sequence => entries[idx].sequence(),
                     _ => unreachable!(),
                 }
             };
@@ -95,26 +143,44 @@ pub fn fasta_sort(
 
     // Write sorted entries
     for &idx in &order {
-        let entry = &entries[idx];
-        output.write_all(entry.header)?;
-        output.write_all(b"\n")?;
-        output.write_all(entry.sequence.as_bytes())?;
-        output.write_all(b"\n")?;
+        match &entries[idx] {
+            StoredEntry::Fasta { header, sequence } => {
+                output.write_all(header)?;
+                output.write_all(b"\n")?;
+                output.write_all(sequence)?;
+                output.write_all(b"\n")?;
+            }
+            StoredEntry::Fastq {
+                header,
+                sequence,
+                quality,
+            } => {
+                output.write_all(header)?;
+                output.write_all(b"\n")?;
+                output.write_all(sequence)?;
+                output.write_all(b"\n+\n")?;
+                output.write_all(quality)?;
+                output.write_all(b"\n")?;
+            }
+        }
     }
 
     output.flush()?;
     Ok(())
 }
 
-/// Sort FASTA sequences by various criteria
+/// Sort sequences by various criteria
 #[derive(Parser)]
 #[command(name = "fasta-sort")]
-#[command(version, about, long_about = None)]
+#[command(version, about = "Sort sequences by name, content, or length")]
+#[command(
+    long_about = "Sort sequences from FASTA or FASTQ files.\nAuto-detects format and preserves it in output.\nUses SIMD-accelerated string sorting for maximum performance."
+)]
 struct Args {
-    /// Input FASTA file (use '-' or omit for stdin)
+    /// Input file (FASTA or FASTQ, use '-' or omit for stdin)
     input: Option<String>,
 
-    /// Output FASTA file (use '-' or omit for stdout)
+    /// Output file (use '-' or omit for stdout)
     #[arg(short, long)]
     output: Option<String>,
 
@@ -166,7 +232,7 @@ fn main() {
         if e.kind() == io::ErrorKind::BrokenPipe {
             process::exit(0);
         }
-        eprintln!("Error processing FASTA: {}", e);
+        eprintln!("Error processing sequences: {}", e);
         process::exit(1);
     }
 }
@@ -227,5 +293,21 @@ mod tests {
         let lines: Vec<&str> = result.lines().collect();
         assert_eq!(lines[0], ">seq2");
         assert_eq!(lines[1], "TTTT");
+    }
+
+    #[test]
+    fn test_fastq_sort_by_length() {
+        let data = b"@seq1\nACGTACGT\n+\nIIIIIIII\n@seq2\nAA\n+\nHH\n@seq3\nTGCA\n+\nJJJJ\n";
+        let mut output = Vec::new();
+        fasta_sort(data, &mut output, SortBy::Length, false).unwrap();
+
+        let result = String::from_utf8(output).unwrap();
+        assert!(result.contains("@seq2"));
+        assert!(result.contains("@seq3"));
+        assert!(result.contains("@seq1"));
+        // Verify quality is preserved
+        assert!(result.contains("HH"));
+        assert!(result.contains("JJJJ"));
+        assert!(result.contains("IIIIIIII"));
     }
 }

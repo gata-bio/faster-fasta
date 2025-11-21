@@ -1,19 +1,32 @@
 ![Faster FASTA Thumbnail](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/faster-fasta.jpg?raw=true)
 
-__Faster FASTA__ is a collection of command-line utilities for processing memory-mapped plain-text FASTA files.
-It's implemented in Rust with [StringZilla](https://github.com/ashvardanian/stringZilla/) to provide high-performance functionality:
+__Faster FASTA__ is a collection of command-line utilities for processing memory-mapped FASTA and FASTQ files.
+It's implemented in Rust with [StringZilla](https://github.com/ashvardanian/StringZilla) to provide high-performance functionality with __auto-format detection__ (@ vs > header inspection).
+
+## Tools Overview
+
+Multi-Format tools for FASTA & FASTQ:
 
 - `fasta-dedup` - remove duplicate sequences
-- `fasta-sample` - randomly sample sequences
+- `fasta-sample` - randomly sample sequences using reservoir sampling
 - `fasta-sort` - sort by name, sequence, or length
-- `fasta-revcomp` - reverse complement DNA sequences
-- `fasta-dna2rna` - convert DNA to RNA (T to U)
+- `fasta-revcomp` - reverse complement DNA sequences (quality also reversed for FASTQ)
+- `fasta-dna2rna` - convert DNA to RNA (T → U)
+
+FASTQ-specific tools:
+
+- `fastq-filter` - filter by quality, length, and N-content
+- `fastq-trim` - quality-based and fixed-position trimming
+- `fastq-stats` - comprehensive statistics with histograms
+- `fastq-to-fasta` - format conversion (drop quality scores)
+- `fastq-interleave` - merge paired-end files (R1 + R2 → interleaved)
+- `fastq-deinterleave` - split interleaved file (interleaved → R1 + R2)
 
 ## Installation
 
 ```bash
-cargo install --git https://github.com/ashvardanian/faster-fasta    # install from GitHub
-cargo install --path .                                              # or install from local clone
+cargo install --git https://github.com/gata-bio/faster-fasta    # install from GitHub
+cargo install --path .                                          # or install from local clone
 ```
 
 ## Usage

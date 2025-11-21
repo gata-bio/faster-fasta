@@ -1,8 +1,9 @@
-//! FASTA reverse complement utility
+//! Reverse complement utility for FASTA and FASTQ files
 //!
 //! Compute reverse complement of DNA sequences.
 //! Uses StringZilla's `lookup()` for SIMD-accelerated nucleotide translation.
 //! Supports standard and ambiguous IUPAC codes.
+//! Auto-detects format and preserves it (FASTQ quality scores are also reversed).
 //!
 //! **Memory**: O(1) - processes one sequence at a time
 //! **Streaming**: Yes - constant memory usage
@@ -10,8 +11,11 @@
 //! # Examples
 //!
 //! ```bash
-//! # From file
+//! # FASTA files
 //! fasta-revcomp sequences.fasta -o revcomp.fasta
+//!
+//! # FASTQ files (quality is also reversed)
+//! fasta-revcomp reads.fastq -o revcomp.fastq
 //!
 //! # Pipe composition
 //! cat sequences.fasta | fasta-revcomp | fasta-sort > sorted_revcomp.fasta
@@ -23,16 +27,18 @@ use std::process;
 use clap::Parser;
 use stringzilla::sz::lookup;
 
-mod faster_fasta;
-use faster_fasta::*;
+mod shared;
+use shared::*;
 
-/// Compute reverse complement of DNA sequences
+/// Compute reverse complement of DNA sequences (FASTA or FASTQ)
 ///
-/// Uses StringZilla's translate() function for fast character mapping.
+/// Uses StringZilla's lookup() function for fast character mapping.
 /// Handles both uppercase and lowercase DNA bases.
+/// For FASTQ files, quality scores are also reversed to match the reversed sequence.
 pub fn fasta_revcomp(input: &[u8], mut output: impl Write) -> io::Result<()> {
+    let format = detect_format(input)?;
+
     // StringZilla translation table for reverse complement
-    // Maps each byte to its complement
     let mut table = [0u8; 256];
     for i in 0..256 {
         table[i] = i as u8;
@@ -50,33 +56,52 @@ pub fn fasta_revcomp(input: &[u8], mut output: impl Write) -> io::Result<()> {
     // Ambiguous bases
     table[b'N' as usize] = b'N';
     table[b'n' as usize] = b'n';
-    table[b'R' as usize] = b'Y'; // A or G -> T or C
-    table[b'Y' as usize] = b'R'; // C or T -> G or A
-    table[b'S' as usize] = b'S'; // G or C -> C or G (palindrome)
-    table[b'W' as usize] = b'W'; // A or T -> T or A (palindrome)
-    table[b'K' as usize] = b'M'; // G or T -> C or A
-    table[b'M' as usize] = b'K'; // A or C -> T or G
-    table[b'B' as usize] = b'V'; // C, G, or T -> G, C, or A
-    table[b'D' as usize] = b'H'; // A, G, or T -> T, C, or A
-    table[b'H' as usize] = b'D'; // A, C, or T -> T, G, or A
-    table[b'V' as usize] = b'B'; // A, C, or G -> T, G, or C
+    table[b'R' as usize] = b'Y';
+    table[b'Y' as usize] = b'R';
+    table[b'S' as usize] = b'S';
+    table[b'W' as usize] = b'W';
+    table[b'K' as usize] = b'M';
+    table[b'M' as usize] = b'K';
+    table[b'B' as usize] = b'V';
+    table[b'D' as usize] = b'H';
+    table[b'H' as usize] = b'D';
+    table[b'V' as usize] = b'B';
 
-    let parser = FastaParser::new(input);
+    match format {
+        SeqFormat::Fasta => {
+            let parser = FastaParser::new(input);
+            for entry in parser {
+                let seq = entry.sequence.as_bytes();
+                let mut revcomp = vec![0u8; seq.len()];
+                lookup(&mut revcomp, seq, table);
+                revcomp.reverse();
 
-    for entry in parser {
-        let seq = entry.sequence.as_bytes();
-        let mut revcomp = vec![0u8; seq.len()];
+                output.write_all(entry.header)?;
+                output.write_all(b"\n")?;
+                output.write_all(&revcomp)?;
+                output.write_all(b"\n")?;
+            }
+        }
+        SeqFormat::Fastq => {
+            let parser = FastqParser::new(input);
+            for entry in parser {
+                let seq = entry.sequence.as_bytes();
+                let mut revcomp = vec![0u8; seq.len()];
+                lookup(&mut revcomp, seq, table);
+                revcomp.reverse();
 
-        // Use StringZilla lookup for complement
-        lookup(&mut revcomp, seq, table);
+                // Also reverse quality scores to match reversed sequence
+                let mut rev_quality = entry.quality.to_vec();
+                rev_quality.reverse();
 
-        // Reverse in place
-        revcomp.reverse();
-
-        output.write_all(entry.header)?;
-        output.write_all(b"\n")?;
-        output.write_all(&revcomp)?;
-        output.write_all(b"\n")?;
+                output.write_all(entry.header)?;
+                output.write_all(b"\n")?;
+                output.write_all(&revcomp)?;
+                output.write_all(b"\n+\n")?;
+                output.write_all(&rev_quality)?;
+                output.write_all(b"\n")?;
+            }
+        }
     }
 
     output.flush()?;
@@ -86,12 +111,15 @@ pub fn fasta_revcomp(input: &[u8], mut output: impl Write) -> io::Result<()> {
 /// Compute reverse complement of DNA sequences
 #[derive(Parser)]
 #[command(name = "fasta-revcomp")]
-#[command(version, about, long_about = None)]
+#[command(version, about = "Compute reverse complement of DNA sequences")]
+#[command(
+    long_about = "Compute reverse complement of DNA sequences from FASTA or FASTQ files.\nFor FASTQ, quality scores are also reversed to match the sequence orientation.\nAuto-detects format and preserves it in output."
+)]
 struct Args {
-    /// Input FASTA file (use '-' or omit for stdin)
+    /// Input file (FASTA or FASTQ, use '-' or omit for stdin)
     input: Option<String>,
 
-    /// Output FASTA file (use '-' or omit for stdout)
+    /// Output file (use '-' or omit for stdout)
     #[arg(short, long)]
     output: Option<String>,
 }
@@ -119,7 +147,7 @@ fn main() {
         if e.kind() == io::ErrorKind::BrokenPipe {
             process::exit(0);
         }
-        eprintln!("Error processing FASTA: {}", e);
+        eprintln!("Error processing sequences: {}", e);
         process::exit(1);
     }
 }

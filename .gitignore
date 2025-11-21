@@ -1,6 +1,9 @@
 # Data
 *.fasta
 *.fa
+*.fastq
+*.fasta.gz
+*.fastq.gz
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

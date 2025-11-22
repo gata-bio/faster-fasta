@@ -1,8 +1,8 @@
 //! Sequence sampling utility for FASTA and FASTQ files
 //!
-//! Randomly sample sequences using reservoir sampling (Algorithm R).
-//! Fixed memory usage regardless of input size.
-//! Auto-detects format and preserves it in output.
+//! Randomly sample sequences using reservoir sampling for fixed counts
+//! and single-pass Bernoulli sampling for fractions. Auto-detects format and
+//! preserves it in output.
 //!
 //! **Memory**: O(k) - only stores sampled sequences
 //! **Streaming**: Yes - reservoir sampling, no materialization
@@ -45,6 +45,21 @@ impl SimpleRng {
     fn gen_range(&mut self, max: u64) -> u64 {
         self.next() % max
     }
+
+    #[inline]
+    fn accept_with_threshold(&mut self, threshold: u64) -> bool {
+        self.next() <= threshold
+    }
+}
+
+fn probability_to_threshold(prob: f64) -> u64 {
+    if prob <= 0.0 {
+        return 0;
+    }
+    if prob >= 1.0 {
+        return u64::MAX;
+    }
+    (prob * (u64::MAX as f64)) as u64
 }
 
 /// Stored entry in reservoir (supports both FASTA and FASTQ)
@@ -80,19 +95,8 @@ pub fn fasta_sample(
         // Reservoir sampling with fixed count
         reservoir_sample_count(input, output, n, &mut rng, format)
     } else if let Some(f) = fraction {
-        // First pass: count total sequences
-        let total = match format {
-            SeqFormat::Fasta => FastaParser::new(input).count(),
-            SeqFormat::Fastq => FastqParser::new(input)
-                .try_fold(0usize, |acc, item| -> io::Result<_> {
-                    item?;
-                    Ok(acc + 1)
-                })?,
-        };
-        let sample_size = ((total as f64 * f).round() as usize).min(total);
-
-        // Second pass: reservoir sampling with calculated size
-        reservoir_sample_count(input, output, sample_size, &mut rng, format)
+        // Single-pass Bernoulli sampling for fraction
+        sample_fraction(input, output, f, &mut rng, format)
     } else {
         Ok(())
     }
@@ -159,6 +163,48 @@ fn reservoir_sample_count(
     write_reservoir(reservoir, output)
 }
 
+fn sample_fraction(
+    input: &[u8],
+    mut output: impl Write,
+    fraction: f64,
+    rng: &mut SimpleRng,
+    format: SeqFormat,
+) -> io::Result<()> {
+    if fraction <= 0.0 {
+        return Ok(());
+    }
+
+    let threshold = probability_to_threshold(fraction);
+
+    match format {
+        SeqFormat::Fasta => {
+            for entry in FastaParser::new(input) {
+                if fraction >= 1.0 || rng.accept_with_threshold(threshold) {
+                    output.write_all(entry.header)?;
+                    output.write_all(b"\n")?;
+                    output.write_all(entry.sequence.as_bytes())?;
+                    output.write_all(b"\n")?;
+                }
+            }
+        }
+        SeqFormat::Fastq => {
+            for entry in FastqParser::new(input) {
+                let entry = entry?;
+                if fraction >= 1.0 || rng.accept_with_threshold(threshold) {
+                    output.write_all(entry.header)?;
+                    output.write_all(b"\n")?;
+                    output.write_all(entry.sequence.as_bytes())?;
+                    output.write_all(b"\n+\n")?;
+                    output.write_all(entry.quality)?;
+                    output.write_all(b"\n")?;
+                }
+            }
+        }
+    }
+
+    output.flush()
+}
+
 fn reservoir_sample_count_fastq_stream(
     mut parser: FastqStreamParser<impl Read>,
     output: impl Write,
@@ -190,6 +236,32 @@ fn reservoir_sample_count_fastq_stream(
         i += 1;
     }
     write_reservoir(reservoir, output)
+}
+
+fn sample_fraction_fastq_stream(
+    mut parser: FastqStreamParser<impl Read>,
+    mut output: impl Write,
+    fraction: f64,
+    rng: &mut SimpleRng,
+) -> io::Result<()> {
+    if fraction <= 0.0 {
+        return Ok(());
+    }
+
+    let threshold = probability_to_threshold(fraction);
+
+    while let Some(entry) = parser.next_entry()? {
+        if fraction >= 1.0 || rng.accept_with_threshold(threshold) {
+            output.write_all(&entry.header)?;
+            output.write_all(b"\n")?;
+            output.write_all(&entry.sequence)?;
+            output.write_all(b"\n+\n")?;
+            output.write_all(&entry.quality)?;
+            output.write_all(b"\n")?;
+        }
+    }
+
+    output.flush()
 }
 
 fn write_reservoir(reservoir: Vec<StoredEntry>, mut output: impl Write) -> io::Result<()> {
@@ -291,25 +363,21 @@ fn main() {
                     fasta_sample(&data, output, args.count, args.fraction, args.seed)
                 }
             }
-            SeqFormat::Fastq => {
-                if let Some(k) = args.count {
-                    reservoir_sample_count_fastq_stream(
-                        FastqStreamParser::new(reader),
-                        output,
-                        k,
-                        &mut rng,
-                    )
-                } else if args.fraction.is_some() {
-                    let mut data = Vec::new();
-                    if let Err(e) = reader.read_to_end(&mut data) {
-                        Err(e)
-                    } else {
-                        fasta_sample(&data, output, args.count, args.fraction, args.seed)
-                    }
-                } else {
-                    Ok(())
-                }
-            }
+            SeqFormat::Fastq => match (args.count, args.fraction) {
+                (Some(k), _) => reservoir_sample_count_fastq_stream(
+                    FastqStreamParser::new(reader),
+                    output,
+                    k,
+                    &mut rng,
+                ),
+                (None, Some(f)) => sample_fraction_fastq_stream(
+                    FastqStreamParser::new(reader),
+                    output,
+                    f,
+                    &mut rng,
+                ),
+                _ => Ok(()),
+            },
         }
     } else {
         let input = match get_input(args.input.as_deref()) {
@@ -369,7 +437,7 @@ mod tests {
 
         let result = String::from_utf8(output).unwrap();
         let count = result.matches('>').count();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
     }
 
     #[test]

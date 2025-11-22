@@ -25,8 +25,7 @@ use std::process;
 
 use clap::Parser;
 
-mod shared;
-use shared::*;
+use faster_fasta::shared::*;
 
 /// Convert FASTQ to FASTA format
 ///

@@ -1,3 +1,12 @@
 {
-  "cSpell.words": ["fasta", "fastq", "StringZilla"]
+  "cSpell.words": [
+    "bioinformatics",
+    "dedup",
+    "deinterleave",
+    "fasta",
+    "fastq",
+    "revcomp",
+    "StringZilla",
+    "Vardanian"
+  ]
 }

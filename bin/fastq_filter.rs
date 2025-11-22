@@ -24,8 +24,7 @@ use std::process;
 
 use clap::Parser;
 
-mod shared;
-use shared::*;
+use faster_fasta::shared::*;
 
 /// Filter FASTQ reads based on quality and content criteria
 ///

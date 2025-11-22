@@ -27,8 +27,7 @@ use std::process;
 use clap::Parser;
 use stringzilla::sz::lookup;
 
-mod shared;
-use shared::*;
+use faster_fasta::shared::*;
 
 /// Compute reverse complement of DNA sequences (FASTA or FASTQ)
 ///

@@ -24,8 +24,7 @@ use std::process;
 
 use clap::Parser;
 
-mod shared;
-use shared::*;
+use faster_fasta::shared::*;
 
 /// Trim a read based on various criteria
 fn trim_read(

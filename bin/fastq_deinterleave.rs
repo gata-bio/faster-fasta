@@ -22,8 +22,7 @@ use std::process;
 
 use clap::Parser;
 
-mod shared;
-use shared::*;
+use faster_fasta::shared::*;
 
 /// Deinterleave a FASTQ file into R1 and R2
 pub fn fastq_deinterleave(

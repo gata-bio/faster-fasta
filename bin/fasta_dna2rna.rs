@@ -26,8 +26,7 @@ use std::process;
 use clap::Parser;
 use stringzilla::sz::lookup;
 
-mod shared;
-use shared::*;
+use faster_fasta::shared::*;
 
 /// Convert DNA sequences to RNA (FASTA or FASTQ)
 ///

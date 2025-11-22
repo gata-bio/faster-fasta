@@ -29,8 +29,7 @@ use std::process;
 use clap::Parser;
 use stringzilla::sz::{argsort_permutation_by, SortedIdx};
 
-mod shared;
-use shared::*;
+use faster_fasta::shared::*;
 
 /// Sort criterion for sequences
 #[derive(Debug, Clone, Copy, PartialEq)]

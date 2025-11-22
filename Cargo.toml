@@ -11,59 +11,63 @@ categories = ["command-line-utilities", "science"]
 repository = "https://github.com/ashvardanian/faster-fasta"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] } # CLI argument parsing
-memmap2 = "0.9"                                   # Memory-mapped file I/O
+clap = { version = "4.5", features = ["derive"] }
+memmap2 = "0.9"
 stringzilla = "4.2.3"
 
 [dev-dependencies]
 tempfile = "3.10"
 
 [profile.release]
-lto = true        # Link-time optimization
-codegen-units = 1 # Better optimization, slower compile
-opt-level = 3     # Maximum optimization
-strip = true      # Strip symbols for smaller binary
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
+
+[lib]
+name = "faster_fasta"
+path = "src/lib.rs"
 
 [[bin]]
 name = "fasta-dedup"
-path = "fasta_dedup.rs"
+path = "bin/fasta_dedup.rs"
 
 [[bin]]
 name = "fasta-sample"
-path = "fasta_sample.rs"
+path = "bin/fasta_sample.rs"
 
 [[bin]]
 name = "fasta-sort"
-path = "fasta_sort.rs"
+path = "bin/fasta_sort.rs"
 
 [[bin]]
 name = "fasta-revcomp"
-path = "fasta_revcomp.rs"
+path = "bin/fasta_revcomp.rs"
 
 [[bin]]
 name = "fasta-dna2rna"
-path = "fasta_dna2rna.rs"
+path = "bin/fasta_dna2rna.rs"
 
 [[bin]]
 name = "fastq-filter"
-path = "fastq_filter.rs"
+path = "bin/fastq_filter.rs"
 
 [[bin]]
 name = "fastq-trim"
-path = "fastq_trim.rs"
+path = "bin/fastq_trim.rs"
 
 [[bin]]
 name = "fastq-stats"
-path = "fastq_stats.rs"
+path = "bin/fastq_stats.rs"
 
 [[bin]]
 name = "fastq-to-fasta"
-path = "fastq_to_fasta.rs"
+path = "bin/fastq_to_fasta.rs"
 
 [[bin]]
 name = "fastq-interleave"
-path = "fastq_interleave.rs"
+path = "bin/fastq_interleave.rs"
 
 [[bin]]
 name = "fastq-deinterleave"
-path = "fastq_deinterleave.rs"
+path = "bin/fastq_deinterleave.rs"

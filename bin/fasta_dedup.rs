@@ -27,8 +27,7 @@ use std::process;
 use clap::Parser;
 use stringzilla::sz::BuildSzHasher;
 
-mod shared;
-use shared::*;
+use faster_fasta::shared::*;
 
 /// Deduplicate sequences (FASTA or FASTQ)
 ///

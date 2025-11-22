@@ -22,8 +22,7 @@ use std::process;
 
 use clap::Parser;
 
-mod shared;
-use shared::*;
+use faster_fasta::shared::*;
 
 /// Interleave two FASTQ files
 pub fn fastq_interleave(r1_data: &[u8], r2_data: &[u8], mut output: impl Write) -> io::Result<()> {

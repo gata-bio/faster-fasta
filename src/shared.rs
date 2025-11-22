@@ -295,7 +295,7 @@ impl<'a> Iterator for FastaParser<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+mod fasta {
     use super::*;
 
     #[test]
@@ -719,7 +719,7 @@ impl<R: Read> FastqStreamParser<R> {
 }
 
 #[cfg(test)]
-mod fastq_tests {
+mod fastq {
     use super::*;
 
     #[test]

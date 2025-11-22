@@ -6,7 +6,7 @@
 //! Supports automatic format detection based on content inspection.
 
 use std::fs::File;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 
 use memmap2::Mmap;
 use stringzilla::sz::{copy, find, find_byteset, hash, Byteset};
@@ -45,7 +45,20 @@ pub fn get_input(path: Option<&str>) -> io::Result<InputSource> {
     }
 }
 
+/// Peek stdin to detect format and return a reader that yields the peeked bytes first
+#[allow(dead_code)]
+pub fn stdin_with_peek(limit: usize) -> io::Result<(SeqFormat, Box<dyn Read>)> {
+    let stdin = io::stdin();
+    let mut locked = stdin.lock();
+    let mut prefix = Vec::with_capacity(limit);
+    locked.by_ref().take(limit as u64).read_to_end(&mut prefix)?;
+    let format = detect_format(&prefix)?;
+    let reader: Box<dyn Read> = Box::new(Cursor::new(prefix).chain(locked));
+    Ok((format, reader))
+}
+
 /// Create an output writer from either a file path or stdout
+#[allow(dead_code)]
 pub fn get_output(path: Option<&str>) -> io::Result<Box<dyn Write>> {
     match path {
         None | Some("-") => Ok(Box::new(BufWriter::new(io::stdout()))),
@@ -104,38 +117,12 @@ pub struct FastqEntry<'a> {
     pub quality: &'a [u8],
 }
 
-/// Unified sequence entry that can be either FASTA or FASTQ
+/// Owned FASTQ entry for streaming stdin
 #[derive(Debug, Clone)]
-pub enum SeqEntry<'a> {
-    Fasta(FastaEntry<'a>),
-    Fastq(FastqEntry<'a>),
-}
-
-impl<'a> SeqEntry<'a> {
-    pub fn header(&self) -> &'a [u8] {
-        match self {
-            SeqEntry::Fasta(e) => e.header,
-            SeqEntry::Fastq(e) => e.header,
-        }
-    }
-
-    pub fn sequence(&self) -> &[u8] {
-        match self {
-            SeqEntry::Fasta(e) => e.sequence.as_bytes(),
-            SeqEntry::Fastq(e) => e.sequence.as_bytes(),
-        }
-    }
-
-    pub fn quality(&self) -> Option<&'a [u8]> {
-        match self {
-            SeqEntry::Fasta(_) => None,
-            SeqEntry::Fastq(e) => Some(e.quality),
-        }
-    }
-
-    pub fn is_fastq(&self) -> bool {
-        matches!(self, SeqEntry::Fastq(_))
-    }
+pub struct FastqOwnedEntry {
+    pub header: Vec<u8>,
+    pub sequence: Vec<u8>,
+    pub quality: Vec<u8>,
 }
 
 /// Sequence file format
@@ -160,7 +147,10 @@ pub fn detect_format(data: &[u8]) -> io::Result<SeqFormat> {
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("Unknown format: expected '@' or '>', found '{}'", byte as char),
+                    format!(
+                        "Unknown format: expected '@' or '>', found '{}'",
+                        byte as char
+                    ),
                 ))
             }
         }
@@ -195,14 +185,6 @@ pub mod quality {
         }
         let sum: u32 = quality.iter().map(|&q| ascii_to_phred33(q) as u32).sum();
         sum as f32 / quality.len() as f32
-    }
-
-    /// Count number of low-quality bases below threshold
-    pub fn count_low_quality(quality: &[u8], threshold: u8) -> usize {
-        quality
-            .iter()
-            .filter(|&&q| ascii_to_phred33(q) < threshold)
-            .count()
     }
 }
 
@@ -317,7 +299,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fasta_parser() {
+    fn fasta_basic() {
         let data = b">seq1\nACGT\n>seq2\nTGCA\n>seq3\nACGT\n";
         let entries: Vec<_> = FastaParser::new(data).collect();
 
@@ -329,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multiline_sequences() {
+    fn fasta_multiline() {
         let data = b">seq1\nACGT\nTGCA\n>seq2\nAAAA\n";
         let entries: Vec<_> = FastaParser::new(data).collect();
 
@@ -339,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multiline_with_whitespace() {
+    fn fasta_multiline_ws() {
         let data = b">seq1\n  ACGT  \n\tTGCA\t\n  GGGG  \n>seq2\nAAAA \n TTTT\n";
         let entries: Vec<_> = FastaParser::new(data).collect();
 
@@ -349,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multiline_with_blank_lines() {
+    fn fasta_multiline_blank() {
         let data = b">seq1\nACGT\n\nTGCA\n\n>seq2\nAAAA\n";
         let entries: Vec<_> = FastaParser::new(data).collect();
 
@@ -359,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multiline_with_mixed_whitespace() {
+    fn fasta_multiline_mixed_ws() {
         let data = b">seq1 description\nACGT TGCA\n  GGGG\n\tCCCC  \n>seq2\n  AAAA\n";
         let entries: Vec<_> = FastaParser::new(data).collect();
 
@@ -369,25 +351,25 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_format_fasta() {
+    fn detect_format_fasta() {
         let data = b">seq1\nACGT\n";
         assert_eq!(detect_format(data).unwrap(), SeqFormat::Fasta);
     }
 
     #[test]
-    fn test_detect_format_fastq() {
+    fn detect_format_fastq() {
         let data = b"@seq1\nACGT\n+\nIIII\n";
         assert_eq!(detect_format(data).unwrap(), SeqFormat::Fastq);
     }
 
     #[test]
-    fn test_detect_format_with_leading_whitespace() {
+    fn detect_format_leading_ws() {
         let data = b"  \n  >seq1\nACGT\n";
         assert_eq!(detect_format(data).unwrap(), SeqFormat::Fasta);
     }
 
     #[test]
-    fn test_quality_conversion() {
+    fn quality_conversion() {
         assert_eq!(quality::ascii_to_phred33(b'!'), 0);
         assert_eq!(quality::ascii_to_phred33(b'I'), 40);
         assert_eq!(quality::phred33_to_ascii(0), b'!');
@@ -395,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mean_quality() {
+    fn mean_quality_values() {
         let qual = b"IIII"; // All Q40
         assert_eq!(quality::mean_quality(qual), 40.0);
 
@@ -429,7 +411,7 @@ impl<'a> FastqParser<'a> {
 }
 
 impl<'a> Iterator for FastqParser<'a> {
-    type Item = FastqEntry<'a>;
+    type Item = io::Result<FastqEntry<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let raw_data = self.data;
@@ -451,7 +433,10 @@ impl<'a> Iterator for FastqParser<'a> {
         self.pos = if header_end < raw_data.len() {
             header_end + 1
         } else {
-            return None; // Incomplete entry
+            return Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FASTQ entry missing sequence/quality",
+            )));
         };
 
         // Parse sequence line(s) - collect until we hit '+'
@@ -466,12 +451,18 @@ impl<'a> Iterator for FastqParser<'a> {
             self.pos = if line_end < raw_data.len() {
                 line_end + 1
             } else {
-                return None; // Incomplete entry
+                return Some(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "FASTQ entry missing sequence lines",
+                )));
             };
         }
 
         if self.pos >= raw_data.len() {
-            return None; // No '+' separator found
+            return Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FASTQ entry missing '+' separator",
+            )));
         }
 
         // Parse sequence
@@ -486,7 +477,10 @@ impl<'a> Iterator for FastqParser<'a> {
         self.pos = if plus_line_end < raw_data.len() {
             plus_line_end + 1
         } else {
-            return None; // Incomplete entry
+            return Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FASTQ entry missing quality header",
+            )));
         };
 
         // Parse quality line(s) - same length as sequence
@@ -509,7 +503,10 @@ impl<'a> Iterator for FastqParser<'a> {
         let qual_end = qual_start + seq_len.min(qual_collected);
 
         if qual_end > raw_data.len() || qual_collected < seq_len {
-            return None; // Incomplete quality string
+            return Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "FASTQ entry missing quality string",
+            )));
         }
 
         // Quality may have newlines - need to strip them
@@ -528,11 +525,196 @@ impl<'a> Iterator for FastqParser<'a> {
             quality_raw
         };
 
-        Some(FastqEntry {
+        if quality.len() != sequence.as_bytes().len() {
+            return Some(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "FASTQ sequence/quality length mismatch: seq {}, qual {}",
+                    sequence.as_bytes().len(),
+                    quality.len()
+                ),
+            )));
+        }
+
+        Some(Ok(FastqEntry {
             header,
             sequence,
             quality,
-        })
+        }))
+    }
+}
+
+/// Streaming FASTQ parser for stdin using a bounded buffer
+pub struct FastqStreamParser<R: Read> {
+    reader: BufReader<R>,
+    buf: Vec<u8>,
+    start: usize,
+    eof: bool,
+}
+
+impl<R: Read> FastqStreamParser<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            buf: Vec::with_capacity(1 << 20), // 1 MiB initial
+            start: 0,
+            eof: false,
+        }
+    }
+
+    fn fill(&mut self) -> io::Result<()> {
+        if self.eof {
+            return Ok(());
+        }
+
+        // Compact buffer if we've consumed a large front portion
+        if self.start > 0 {
+            let remaining = self.buf.len().saturating_sub(self.start);
+            self.buf.copy_within(self.start.., 0);
+            self.buf.truncate(remaining);
+            self.start = 0;
+        }
+
+        // Grow capacity if needed
+        if self.buf.len() == self.buf.capacity() {
+            let new_cap = (self.buf.capacity().max(1024)) * 2;
+            self.buf.reserve(new_cap - self.buf.capacity());
+        }
+
+        let old_len = self.buf.len();
+        // Make room for read
+        let chunk = 1 << 20;
+        self.buf.resize(old_len + chunk, 0);
+        let read_n = self.reader.read(&mut self.buf[old_len..])?;
+        self.buf.truncate(old_len + read_n);
+
+        if read_n == 0 {
+            self.eof = true;
+        }
+        Ok(())
+    }
+
+    fn find_newline(&mut self, from: usize) -> io::Result<Option<usize>> {
+        let pos = from;
+        loop {
+            if pos >= self.buf.len() {
+                if self.eof {
+                    return Ok(None);
+                }
+                self.fill()?;
+                continue;
+            }
+            if let Some(rel) = find(&self.buf[pos..], b"\n") {
+                return Ok(Some(pos + rel));
+            }
+            if self.eof {
+                return Ok(None);
+            }
+            self.fill()?;
+        }
+    }
+
+    pub fn next_entry(&mut self) -> io::Result<Option<FastqOwnedEntry>> {
+        loop {
+            if self.start >= self.buf.len() {
+                if self.eof {
+                    return Ok(None);
+                }
+                self.fill()?;
+                continue;
+            }
+
+            if self.buf[self.start] != b'@' {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "FASTQ header must start with '@'",
+                ));
+            }
+
+            // Header
+            let header_end = self.find_newline(self.start)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "FASTQ header missing newline")
+            })?;
+            let header = self.buf[self.start..header_end].to_vec();
+            let mut pos = header_end + 1;
+
+            // Sequence lines until '+'
+            let mut sequence = Vec::new();
+            loop {
+                if pos >= self.buf.len() {
+                    if self.eof {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "FASTQ sequence truncated",
+                        ));
+                    }
+                    self.fill()?;
+                    continue;
+                }
+                if self.buf[pos] == b'+' {
+                    break;
+                }
+                let line_end = self.find_newline(pos)?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "FASTQ sequence line missing newline",
+                    )
+                })?;
+                sequence.extend_from_slice(&self.buf[pos..line_end]);
+                pos = line_end + 1;
+            }
+
+            // Plus line
+            let plus_line_end = self.find_newline(pos)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "FASTQ '+' line missing newline")
+            })?;
+            pos = plus_line_end + 1;
+
+            // Quality lines
+            let mut quality = Vec::with_capacity(sequence.len());
+            while quality.len() < sequence.len() {
+                if pos >= self.buf.len() {
+                    if self.eof {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "FASTQ quality truncated",
+                        ));
+                    }
+                    self.fill()?;
+                    continue;
+                }
+                let line_end = match self.find_newline(pos)? {
+                    Some(v) => v,
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "FASTQ quality line missing newline",
+                        ))
+                    }
+                };
+                quality.extend_from_slice(&self.buf[pos..line_end]);
+                pos = line_end + 1;
+            }
+
+            if quality.len() != sequence.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "FASTQ sequence/quality length mismatch: seq {}, qual {}",
+                        sequence.len(),
+                        quality.len()
+                    ),
+                ));
+            }
+
+            self.start = pos;
+
+            return Ok(Some(FastqOwnedEntry {
+                header,
+                sequence,
+                quality,
+            }));
+        }
     }
 }
 
@@ -541,9 +723,9 @@ mod fastq_tests {
     use super::*;
 
     #[test]
-    fn test_fastq_parser_single_line() {
+    fn parser_single_line() {
         let data = b"@seq1\nACGT\n+\nIIII\n@seq2\nTGCA\n+\nHHHH\n";
-        let entries: Vec<_> = FastqParser::new(data).collect();
+        let entries: Vec<_> = FastqParser::new(data).collect::<Result<_, _>>().unwrap();
 
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].header, b"@seq1");
@@ -555,9 +737,9 @@ mod fastq_tests {
     }
 
     #[test]
-    fn test_fastq_parser_with_description() {
+    fn parser_with_desc() {
         let data = b"@seq1 description here\nACGT\n+\nIIII\n";
-        let entries: Vec<_> = FastqParser::new(data).collect();
+        let entries: Vec<_> = FastqParser::new(data).collect::<Result<_, _>>().unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].header, b"@seq1 description here");
@@ -566,9 +748,9 @@ mod fastq_tests {
     }
 
     #[test]
-    fn test_fastq_parser_multiline_sequence() {
+    fn parser_multiline_seq() {
         let data = b"@seq1\nACGT\nTGCA\n+\nIIII\nHHHH\n";
-        let entries: Vec<_> = FastqParser::new(data).collect();
+        let entries: Vec<_> = FastqParser::new(data).collect::<Result<_, _>>().unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].sequence.as_bytes(), b"ACGTTGCA");
@@ -576,12 +758,39 @@ mod fastq_tests {
     }
 
     #[test]
-    fn test_fastq_parser_empty_sequence() {
+    fn parser_empty_seq() {
         let data = b"@seq1\n\n+\n\n";
-        let entries: Vec<_> = FastqParser::new(data).collect();
+        let entries: Vec<_> = FastqParser::new(data).collect::<Result<_, _>>().unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].sequence.as_bytes(), b"");
         assert_eq!(entries[0].quality, b"");
+    }
+
+    #[test]
+    fn parser_mismatch_len() {
+        let data = b"@seq1\nACGT\n+\n!!!\n";
+        let mut parser = FastqParser::new(data);
+        let err = parser.next().unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn stream_round_trip() {
+        let data = b"@seq1\nACGT\n+\nIIII\n@seq2\nTGCA\n+\nHHHH\n";
+        let mut parser = FastqStreamParser::new(std::io::Cursor::new(data));
+        let mut out = Vec::new();
+        while let Some(entry) = parser.next_entry().unwrap() {
+            out.extend_from_slice(&entry.header);
+            out.push(b'\n');
+            out.extend_from_slice(&entry.sequence);
+            out.push(b'\n');
+            out.extend_from_slice(&entry.quality);
+            out.push(b'\n');
+        }
+        let reconstructed = String::from_utf8(out).unwrap();
+        assert!(reconstructed.contains("@seq1"));
+        assert!(reconstructed.contains("@seq2"));
+        assert!(reconstructed.contains("IIII"));
     }
 }

@@ -23,7 +23,7 @@
 //! cat sequences.fasta | fasta-sort -l -r > sorted.fasta
 //! ```
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::process;
 
 use clap::Parser;
@@ -76,13 +76,12 @@ impl StoredEntry {
 /// Auto-detects format and preserves it in output.
 pub fn fasta_sort(
     input: &[u8],
-    mut output: impl Write,
+    output: impl Write,
     sort_by: SortBy,
     reverse: bool,
 ) -> io::Result<()> {
     let format = detect_format(input)?;
 
-    // Materialize all entries
     let entries: Vec<StoredEntry> = match format {
         SeqFormat::Fasta => FastaParser::new(input)
             .map(|e| StoredEntry::Fasta {
@@ -91,14 +90,26 @@ pub fn fasta_sort(
             })
             .collect(),
         SeqFormat::Fastq => FastqParser::new(input)
-            .map(|e| StoredEntry::Fastq {
-                header: e.header.to_vec(),
-                sequence: e.sequence.as_bytes().to_vec(),
-                quality: e.quality.to_vec(),
+            .map(|e| {
+                let e = e?;
+                Ok(StoredEntry::Fastq {
+                    header: e.header.to_vec(),
+                    sequence: e.sequence.as_bytes().to_vec(),
+                    quality: e.quality.to_vec(),
+                })
             })
-            .collect(),
+            .collect::<io::Result<_>>()?,
     };
 
+    sort_entries(entries, output, sort_by, reverse)
+}
+
+fn sort_entries(
+    entries: Vec<StoredEntry>,
+    mut output: impl Write,
+    sort_by: SortBy,
+    reverse: bool,
+) -> io::Result<()> {
     let count = entries.len();
     if count == 0 {
         return Ok(());
@@ -169,6 +180,20 @@ pub fn fasta_sort(
     Ok(())
 }
 
+fn collect_fastq_entries_stream(
+    mut parser: FastqStreamParser<impl Read>,
+) -> io::Result<Vec<StoredEntry>> {
+    let mut entries = Vec::new();
+    while let Some(entry) = parser.next_entry()? {
+        entries.push(StoredEntry::Fastq {
+            header: entry.header,
+            sequence: entry.sequence,
+            quality: entry.quality,
+        });
+    }
+    Ok(entries)
+}
+
 /// Sort sequences by various criteria
 #[derive(Parser)]
 #[command(name = "fasta-sort")]
@@ -212,23 +237,62 @@ fn main() {
         SortBy::Name // Default
     };
 
-    let input = match get_input(args.input.as_deref()) {
-        Ok(input) => input,
-        Err(e) => {
-            eprintln!("Error reading input: {}", e);
-            process::exit(1);
+    let use_stream = matches!(args.input.as_deref(), None | Some("-"));
+
+    let result = if use_stream {
+        let (format, mut reader) = match stdin_with_peek(8192) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Error reading input: {}", e);
+                process::exit(1);
+            }
+        };
+
+        let output = match get_output(args.output.as_deref()) {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("Error opening output: {}", e);
+                process::exit(1);
+            }
+        };
+
+        match format {
+            SeqFormat::Fasta => {
+                let mut data = Vec::new();
+                if let Err(e) = reader.read_to_end(&mut data) {
+                    Err(e)
+                } else {
+                    fasta_sort(&data, output, sort_by, args.reverse)
+                }
+            }
+            SeqFormat::Fastq => {
+                match collect_fastq_entries_stream(FastqStreamParser::new(reader)) {
+                    Ok(entries) => sort_entries(entries, output, sort_by, args.reverse),
+                    Err(e) => Err(e),
+                }
+            }
         }
+    } else {
+        let input = match get_input(args.input.as_deref()) {
+            Ok(input) => input,
+            Err(e) => {
+                eprintln!("Error reading input: {}", e);
+                process::exit(1);
+            }
+        };
+
+        let output = match get_output(args.output.as_deref()) {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("Error opening output: {}", e);
+                process::exit(1);
+            }
+        };
+
+        fasta_sort(input.as_bytes(), output, sort_by, args.reverse)
     };
 
-    let output = match get_output(args.output.as_deref()) {
-        Ok(output) => output,
-        Err(e) => {
-            eprintln!("Error opening output: {}", e);
-            process::exit(1);
-        }
-    };
-
-    if let Err(e) = fasta_sort(input.as_bytes(), output, sort_by, args.reverse) {
+    if let Err(e) = result {
         if e.kind() == io::ErrorKind::BrokenPipe {
             process::exit(0);
         }
@@ -242,7 +306,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sort_by_name() {
+    fn sort_by_name() {
         let data = b">seq3\nACGT\n>seq1\nTGCA\n>seq2\nAAAA\n";
         let mut output = Vec::new();
         fasta_sort(data, &mut output, SortBy::Name, false).unwrap();
@@ -255,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_by_sequence() {
+    fn sort_by_sequence() {
         let data = b">seq1\nTGCA\n>seq2\nACGT\n>seq3\nGGGG\n";
         let mut output = Vec::new();
         fasta_sort(data, &mut output, SortBy::Sequence, false).unwrap();
@@ -268,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_by_length() {
+    fn sort_by_length() {
         let data = b">seq1\nACGTACGT\n>seq2\nAA\n>seq3\nTGCA\n";
         let mut output = Vec::new();
         fasta_sort(data, &mut output, SortBy::Length, false).unwrap();
@@ -284,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_reverse() {
+    fn sort_reverse() {
         let data = b">seq1\nAA\n>seq2\nTTTT\n>seq3\nGG\n";
         let mut output = Vec::new();
         fasta_sort(data, &mut output, SortBy::Length, true).unwrap();
@@ -296,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fastq_sort_by_length() {
+    fn sort_fastq_by_length() {
         let data = b"@seq1\nACGTACGT\n+\nIIIIIIII\n@seq2\nAA\n+\nHH\n@seq3\nTGCA\n+\nJJJJ\n";
         let mut output = Vec::new();
         fasta_sort(data, &mut output, SortBy::Length, false).unwrap();

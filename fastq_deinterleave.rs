@@ -34,6 +34,7 @@ pub fn fastq_deinterleave(
     let parser = FastqParser::new(input);
 
     for (i, entry) in parser.enumerate() {
+        let entry = entry?;
         if i % 2 == 0 {
             // R1 (even indices: 0, 2, 4, ...)
             r1_out.write_all(entry.header)?;
@@ -119,7 +120,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_deinterleave_basic() {
+    fn deinterleave_basic() {
         let data = b"@read1/1\nACGT\n+\nIIII\n@read1/2\nGGGG\n+\nJJJJ\n@read2/1\nTGCA\n+\nHHHH\n@read2/2\nCCCC\n+\nKKKK\n";
         let mut r1_out = Vec::new();
         let mut r2_out = Vec::new();

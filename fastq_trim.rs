@@ -19,7 +19,7 @@
 //! fastq-trim reads.fastq --max-length 100 --min-length 50 -o trimmed.fastq
 //! ```
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::process;
 
 use clap::Parser;
@@ -88,6 +88,7 @@ pub fn fastq_trim(
     let parser = FastqParser::new(input);
 
     for entry in parser {
+        let entry = entry?;
         let seq = entry.sequence.as_bytes();
         let qual = entry.quality;
 
@@ -103,6 +104,37 @@ pub fn fastq_trim(
 
         // Write trimmed read
         output.write_all(entry.header)?;
+        output.write_all(b"\n")?;
+        output.write_all(&trimmed_seq)?;
+        output.write_all(b"\n+\n")?;
+        output.write_all(&trimmed_qual)?;
+        output.write_all(b"\n")?;
+    }
+
+    output.flush()?;
+    Ok(())
+}
+
+fn fastq_trim_stream(
+    mut parser: FastqStreamParser<impl Read>,
+    mut output: impl Write,
+    quality_cutoff: Option<u8>,
+    trim_front: usize,
+    trim_tail: usize,
+    max_length: Option<usize>,
+    min_length: Option<usize>,
+) -> io::Result<()> {
+    while let Some(entry) = parser.next_entry()? {
+        let (trimmed_seq, trimmed_qual) =
+            trim_read(&entry.sequence, &entry.quality, quality_cutoff, trim_front, trim_tail, max_length);
+
+        if let Some(min_len) = min_length {
+            if trimmed_seq.len() < min_len {
+                continue;
+            }
+        }
+
+        output.write_all(&entry.header)?;
         output.write_all(b"\n")?;
         output.write_all(&trimmed_seq)?;
         output.write_all(b"\n+\n")?;
@@ -153,36 +185,64 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    let input = match get_input(args.input.as_deref()) {
-        Ok(input) => input,
-        Err(e) => {
-            eprintln!("Error reading input: {}", e);
+    let use_stream = matches!(args.input.as_deref(), None | Some("-"));
+
+    if use_stream {
+        let output = match get_output(args.output.as_deref()) {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("Error opening output: {}", e);
+                process::exit(1);
+            }
+        };
+
+        if let Err(e) = fastq_trim_stream(
+            FastqStreamParser::new(io::stdin()),
+            output,
+            args.quality_cutoff,
+            args.trim_front,
+            args.trim_tail,
+            args.max_length,
+            args.min_length,
+        ) {
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                process::exit(0);
+            }
+            eprintln!("Error processing FASTQ: {}", e);
             process::exit(1);
         }
-    };
+    } else {
+        let input = match get_input(args.input.as_deref()) {
+            Ok(input) => input,
+            Err(e) => {
+                eprintln!("Error reading input: {}", e);
+                process::exit(1);
+            }
+        };
 
-    let output = match get_output(args.output.as_deref()) {
-        Ok(output) => output,
-        Err(e) => {
-            eprintln!("Error opening output: {}", e);
+        let output = match get_output(args.output.as_deref()) {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("Error opening output: {}", e);
+                process::exit(1);
+            }
+        };
+
+        if let Err(e) = fastq_trim(
+            input.as_bytes(),
+            output,
+            args.quality_cutoff,
+            args.trim_front,
+            args.trim_tail,
+            args.max_length,
+            args.min_length,
+        ) {
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                process::exit(0);
+            }
+            eprintln!("Error processing FASTQ: {}", e);
             process::exit(1);
         }
-    };
-
-    if let Err(e) = fastq_trim(
-        input.as_bytes(),
-        output,
-        args.quality_cutoff,
-        args.trim_front,
-        args.trim_tail,
-        args.max_length,
-        args.min_length,
-    ) {
-        if e.kind() == io::ErrorKind::BrokenPipe {
-            process::exit(0);
-        }
-        eprintln!("Error processing FASTQ: {}", e);
-        process::exit(1);
     }
 }
 
@@ -191,7 +251,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_trim_front() {
+    fn trim_front() {
         let data = b"@seq1\nACGTACGT\n+\nIIIIIIII\n";
         let mut output = Vec::new();
         fastq_trim(&data[..], &mut output, None, 2, 0, None, None).unwrap();
@@ -201,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trim_tail() {
+    fn trim_tail() {
         let data = b"@seq1\nACGTACGT\n+\nIIIIIIII\n";
         let mut output = Vec::new();
         fastq_trim(&data[..], &mut output, None, 0, 2, None, None).unwrap();
@@ -211,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_min_length_filter() {
+    fn min_length_filter() {
         let data = b"@seq1\nACGT\n+\nIIII\n";
         let mut output = Vec::new();
         fastq_trim(&data[..], &mut output, None, 2, 0, None, Some(10)).unwrap();

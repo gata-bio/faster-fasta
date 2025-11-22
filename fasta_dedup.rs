@@ -21,7 +21,7 @@
 //! ```
 
 use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::process;
 
 use clap::Parser;
@@ -55,6 +55,7 @@ pub fn fasta_dedup(input: &[u8], mut output: impl Write) -> io::Result<()> {
         SeqFormat::Fastq => {
             let parser = FastqParser::new(input);
             for entry in parser {
+                let entry = entry?;
                 if seen_sequences.insert(entry.sequence.clone()) {
                     output.write_all(entry.header)?;
                     output.write_all(b"\n")?;
@@ -67,6 +68,25 @@ pub fn fasta_dedup(input: &[u8], mut output: impl Write) -> io::Result<()> {
         }
     }
 
+    output.flush()?;
+    Ok(())
+}
+
+fn fasta_dedup_fastq_stream(
+    mut parser: FastqStreamParser<impl Read>,
+    mut output: impl Write,
+) -> io::Result<()> {
+    let mut seen: HashSet<Vec<u8>, BuildSzHasher> = HashSet::with_hasher(BuildSzHasher::default());
+    while let Some(entry) = parser.next_entry()? {
+        if seen.insert(entry.sequence.clone()) {
+            output.write_all(&entry.header)?;
+            output.write_all(b"\n")?;
+            output.write_all(&entry.sequence)?;
+            output.write_all(b"\n+\n")?;
+            output.write_all(&entry.quality)?;
+            output.write_all(b"\n")?;
+        }
+    }
     output.flush()?;
     Ok(())
 }
@@ -93,28 +113,68 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    let input = match get_input(args.input.as_deref()) {
-        Ok(input) => input,
-        Err(e) => {
-            eprintln!("Error reading input: {}", e);
+    let use_stream = matches!(args.input.as_deref(), None | Some("-"));
+
+    if use_stream {
+        let output = match get_output(args.output.as_deref()) {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("Error opening output: {}", e);
+                process::exit(1);
+            }
+        };
+
+        let (format, mut reader) = match stdin_with_peek(8192) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Error reading input: {}", e);
+                process::exit(1);
+            }
+        };
+
+        let result = match format {
+            SeqFormat::Fastq => fasta_dedup_fastq_stream(FastqStreamParser::new(reader), output),
+            SeqFormat::Fasta => {
+                let mut data = Vec::new();
+                if let Err(e) = reader.read_to_end(&mut data) {
+                    eprintln!("Error reading input: {}", e);
+                    process::exit(1);
+                }
+                fasta_dedup(&data, output)
+            }
+        };
+
+        if let Err(e) = result {
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                process::exit(0);
+            }
+            eprintln!("Error processing sequences: {}", e);
             process::exit(1);
         }
-    };
+    } else {
+        let input = match get_input(args.input.as_deref()) {
+            Ok(input) => input,
+            Err(e) => {
+                eprintln!("Error reading input: {}", e);
+                process::exit(1);
+            }
+        };
 
-    let output = match get_output(args.output.as_deref()) {
-        Ok(output) => output,
-        Err(e) => {
-            eprintln!("Error opening output: {}", e);
+        let output = match get_output(args.output.as_deref()) {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("Error opening output: {}", e);
+                process::exit(1);
+            }
+        };
+
+        if let Err(e) = fasta_dedup(input.as_bytes(), output) {
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                process::exit(0);
+            }
+            eprintln!("Error processing sequences: {}", e);
             process::exit(1);
         }
-    };
-
-    if let Err(e) = fasta_dedup(input.as_bytes(), output) {
-        if e.kind() == io::ErrorKind::BrokenPipe {
-            process::exit(0);
-        }
-        eprintln!("Error processing sequences: {}", e);
-        process::exit(1);
     }
 }
 
@@ -123,7 +183,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fasta_dedup() {
+    fn dedup_fasta() {
         let data = b">seq1\nACGT\n>seq2\nTGCA\n>seq3\nACGT\n";
         let mut output = Vec::new();
         fasta_dedup(data, &mut output).unwrap();
@@ -135,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_with_whitespace_variations() {
+    fn dedup_whitespace() {
         let data = b">seq1\nACGT\n>seq2\n  ACGT  \n>seq3\nA C G T\n";
         let mut output = Vec::new();
         fasta_dedup(data, &mut output).unwrap();
@@ -148,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fastq_dedup() {
+    fn dedup_fastq() {
         let data = b"@seq1\nACGT\n+\nIIII\n@seq2\nTGCA\n+\nHHHH\n@seq3\nACGT\n+\nJJJJ\n";
         let mut output = Vec::new();
         fasta_dedup(data, &mut output).unwrap();

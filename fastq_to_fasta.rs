@@ -20,7 +20,7 @@
 //! cat reads.fastq | fastq-to-fasta > sequences.fasta
 //! ```
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::process;
 
 use clap::Parser;
@@ -40,6 +40,7 @@ pub fn fastq_to_fasta(
     let parser = FastqParser::new(input);
 
     for entry in parser {
+        let entry = entry?;
         // Optional quality filter
         if let Some(min_q) = min_quality {
             if quality::mean_quality(entry.quality) < min_q {
@@ -58,6 +59,30 @@ pub fn fastq_to_fasta(
         output.write_all(b"\n")?;
     }
 
+    output.flush()?;
+    Ok(())
+}
+
+fn fastq_to_fasta_stream(
+    mut parser: FastqStreamParser<impl Read>,
+    mut output: impl Write,
+    min_quality: Option<f32>,
+) -> io::Result<()> {
+    while let Some(entry) = parser.next_entry()? {
+        if let Some(min_q) = min_quality {
+            if quality::mean_quality(&entry.quality) < min_q {
+                continue;
+            }
+        }
+
+        output.write_all(b">")?;
+        if entry.header.len() > 1 {
+            output.write_all(&entry.header[1..])?;
+        }
+        output.write_all(b"\n")?;
+        output.write_all(&entry.sequence)?;
+        output.write_all(b"\n")?;
+    }
     output.flush()?;
     Ok(())
 }
@@ -85,28 +110,52 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    let input = match get_input(args.input.as_deref()) {
-        Ok(input) => input,
-        Err(e) => {
-            eprintln!("Error reading input: {}", e);
+    let use_stream = matches!(args.input.as_deref(), None | Some("-"));
+
+    if use_stream {
+        let output = match get_output(args.output.as_deref()) {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("Error opening output: {}", e);
+                process::exit(1);
+            }
+        };
+
+        if let Err(e) = fastq_to_fasta_stream(
+            FastqStreamParser::new(io::stdin()),
+            output,
+            args.min_quality,
+        ) {
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                process::exit(0);
+            }
+            eprintln!("Error processing FASTQ: {}", e);
             process::exit(1);
         }
-    };
+    } else {
+        let input = match get_input(args.input.as_deref()) {
+            Ok(input) => input,
+            Err(e) => {
+                eprintln!("Error reading input: {}", e);
+                process::exit(1);
+            }
+        };
 
-    let output = match get_output(args.output.as_deref()) {
-        Ok(output) => output,
-        Err(e) => {
-            eprintln!("Error opening output: {}", e);
+        let output = match get_output(args.output.as_deref()) {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("Error opening output: {}", e);
+                process::exit(1);
+            }
+        };
+
+        if let Err(e) = fastq_to_fasta(input.as_bytes(), output, args.min_quality) {
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                process::exit(0);
+            }
+            eprintln!("Error processing FASTQ: {}", e);
             process::exit(1);
         }
-    };
-
-    if let Err(e) = fastq_to_fasta(input.as_bytes(), output, args.min_quality) {
-        if e.kind() == io::ErrorKind::BrokenPipe {
-            process::exit(0);
-        }
-        eprintln!("Error processing FASTQ: {}", e);
-        process::exit(1);
     }
 }
 
@@ -115,7 +164,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_basic_conversion() {
+    fn basic_conversion() {
         let data = b"@seq1 description\nACGT\n+\nIIII\n@seq2\nTGCA\n+\nHHHH\n";
         let mut output = Vec::new();
         fastq_to_fasta(data, &mut output, None).unwrap();
@@ -132,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn test_with_quality_filter() {
+    fn with_quality_filter() {
         // IIII = Q40, !!!! = Q0
         let data = b"@seq1\nACGT\n+\nIIII\n@seq2\nTGCA\n+\n!!!!\n";
         let mut output = Vec::new();
@@ -146,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_input() {
+    fn empty_input() {
         let data = b"";
         let mut output = Vec::new();
         fastq_to_fasta(data, &mut output, None).unwrap();

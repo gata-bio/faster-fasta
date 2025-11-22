@@ -63,6 +63,7 @@ pub fn fasta_dna2rna(input: &[u8], mut output: impl Write) -> io::Result<()> {
         SeqFormat::Fastq => {
             let parser = FastqParser::new(input);
             for entry in parser {
+                let entry = entry?;
                 let seq = entry.sequence.as_bytes();
                 let mut rna = vec![0u8; seq.len()];
                 lookup(&mut rna, seq, table);
@@ -130,7 +131,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dna2rna_simple() {
+    fn dna2rna_simple() {
         let data = b">seq1\nACGT\n";
         let mut output = Vec::new();
         fasta_dna2rna(data, &mut output).unwrap();
@@ -141,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dna2rna_no_thymine() {
+    fn dna2rna_no_thymine() {
         let data = b">seq1\nACGACG\n";
         let mut output = Vec::new();
         fasta_dna2rna(data, &mut output).unwrap();
@@ -151,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dna2rna_all_thymine() {
+    fn dna2rna_all_thymine() {
         let data = b">seq1\nTTTT\n";
         let mut output = Vec::new();
         fasta_dna2rna(data, &mut output).unwrap();
@@ -161,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dna2rna_mixed_case() {
+    fn dna2rna_mixed_case() {
         let data = b">seq1\nAcGt\n";
         let mut output = Vec::new();
         fasta_dna2rna(data, &mut output).unwrap();
@@ -171,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dna2rna_multiple() {
+    fn dna2rna_multiple() {
         let data = b">seq1\nATGC\n>seq2\nTTAA\n";
         let mut output = Vec::new();
         fasta_dna2rna(data, &mut output).unwrap();
@@ -183,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fastq_dna2rna() {
+    fn dna2rna_fastq() {
         let data = b"@seq1\nATGC\n+\nIIII\n@seq2\nTTAA\n+\nHHHH\n";
         let mut output = Vec::new();
         fasta_dna2rna(data, &mut output).unwrap();

@@ -19,7 +19,7 @@
 //! fastq-filter reads.fastq --min-quality 25 --min-length 75 --max-length 150 -o filtered.fastq
 //! ```
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::process;
 
 use clap::Parser;
@@ -42,6 +42,7 @@ pub fn fastq_filter(
     let parser = FastqParser::new(input);
 
     for entry in parser {
+        let entry = entry?;
         let seq = entry.sequence.as_bytes();
         let qual = entry.quality;
 
@@ -76,6 +77,56 @@ pub fn fastq_filter(
 
         // Read passed all filters - write it
         output.write_all(entry.header)?;
+        output.write_all(b"\n")?;
+        output.write_all(seq)?;
+        output.write_all(b"\n+\n")?;
+        output.write_all(qual)?;
+        output.write_all(b"\n")?;
+    }
+
+    output.flush()?;
+    Ok(())
+}
+
+fn fastq_filter_stream(
+    mut parser: FastqStreamParser<impl Read>,
+    mut output: impl Write,
+    min_quality: Option<f32>,
+    min_length: Option<usize>,
+    max_length: Option<usize>,
+    max_n_fraction: Option<f32>,
+) -> io::Result<()> {
+    while let Some(entry) = parser.next_entry()? {
+        let seq = entry.sequence.as_slice();
+        let qual = entry.quality.as_slice();
+
+        if let Some(min_q) = min_quality {
+            if quality::mean_quality(qual) < min_q {
+                continue;
+            }
+        }
+
+        let seq_len = seq.len();
+        if let Some(min_len) = min_length {
+            if seq_len < min_len {
+                continue;
+            }
+        }
+        if let Some(max_len) = max_length {
+            if seq_len > max_len {
+                continue;
+            }
+        }
+
+        if let Some(max_n) = max_n_fraction {
+            let n_count = seq.iter().filter(|&&b| b == b'N' || b == b'n').count();
+            let n_frac = n_count as f32 / seq_len as f32;
+            if n_frac > max_n {
+                continue;
+            }
+        }
+
+        output.write_all(&entry.header)?;
         output.write_all(b"\n")?;
         output.write_all(seq)?;
         output.write_all(b"\n+\n")?;
@@ -133,35 +184,62 @@ fn main() {
         }
     }
 
-    let input = match get_input(args.input.as_deref()) {
-        Ok(input) => input,
-        Err(e) => {
-            eprintln!("Error reading input: {}", e);
+    let use_stream = matches!(args.input.as_deref(), None | Some("-"));
+
+    if use_stream {
+        let output = match get_output(args.output.as_deref()) {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("Error opening output: {}", e);
+                process::exit(1);
+            }
+        };
+
+        if let Err(e) = fastq_filter_stream(
+            FastqStreamParser::new(io::stdin()),
+            output,
+            args.min_quality,
+            args.min_length,
+            args.max_length,
+            args.max_n_fraction,
+        ) {
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                process::exit(0);
+            }
+            eprintln!("Error processing FASTQ: {}", e);
             process::exit(1);
         }
-    };
+    } else {
+        let input = match get_input(args.input.as_deref()) {
+            Ok(input) => input,
+            Err(e) => {
+                eprintln!("Error reading input: {}", e);
+                process::exit(1);
+            }
+        };
 
-    let output = match get_output(args.output.as_deref()) {
-        Ok(output) => output,
-        Err(e) => {
-            eprintln!("Error opening output: {}", e);
+        let output = match get_output(args.output.as_deref()) {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("Error opening output: {}", e);
+                process::exit(1);
+            }
+        };
+
+        if let Err(e) = fastq_filter(
+            input.as_bytes(),
+            output,
+            args.min_quality,
+            args.min_length,
+            args.max_length,
+            args.max_n_fraction,
+        ) {
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                process::exit(0);
+            }
+            eprintln!("Error processing FASTQ: {}", e);
             process::exit(1);
         }
-    };
-
-    if let Err(e) = fastq_filter(
-        input.as_bytes(),
-        output,
-        args.min_quality,
-        args.min_length,
-        args.max_length,
-        args.max_n_fraction,
-    ) {
-        if e.kind() == io::ErrorKind::BrokenPipe {
-            process::exit(0);
-        }
-        eprintln!("Error processing FASTQ: {}", e);
-        process::exit(1);
     }
 }
 
@@ -170,7 +248,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_filter_by_quality() {
+    fn filter_by_quality() {
         // Quality: IIII = Q40, HHHH = Q39, !!!! = Q0
         let data = b"@seq1\nACGT\n+\nIIII\n@seq2\nTGCA\n+\nHHHH\n@seq3\nAAAA\n+\n!!!!\n";
         let mut output = Vec::new();
@@ -183,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_by_length() {
+    fn filter_by_length() {
         let data = b"@seq1\nACGT\n+\nIIII\n@seq2\nAA\n+\nII\n@seq3\nACGTACGT\n+\nIIIIIIII\n";
         let mut output = Vec::new();
         fastq_filter(&data[..], &mut output, None, Some(4), Some(6), None).unwrap();
@@ -195,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_by_n_content() {
+    fn filter_by_n_content() {
         let data = b"@seq1\nACGT\n+\nIIII\n@seq2\nNNNN\n+\nIIII\n@seq3\nACNT\n+\nIIII\n";
         let mut output = Vec::new();
         fastq_filter(&data[..], &mut output, None, None, None, Some(0.5)).unwrap();
@@ -207,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_filters() {
+    fn filter_multiple() {
         let data = b"@seq1\nACGT\n+\nIIII\n@seq2\nAC\n+\nII\n@seq3\nACGT\n+\n!!!!\n";
         let mut output = Vec::new();
         fastq_filter(&data[..], &mut output, Some(20.0), Some(4), None, None).unwrap();

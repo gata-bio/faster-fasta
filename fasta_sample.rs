@@ -20,7 +20,7 @@
 //! cat sequences.fasta | fasta-sample --count 100 > sample.fasta
 //! ```
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::process;
 
 use clap::Parser;
@@ -84,7 +84,11 @@ pub fn fasta_sample(
         // First pass: count total sequences
         let total = match format {
             SeqFormat::Fasta => FastaParser::new(input).count(),
-            SeqFormat::Fastq => FastqParser::new(input).count(),
+            SeqFormat::Fastq => FastqParser::new(input)
+                .try_fold(0usize, |acc, item| -> io::Result<_> {
+                    item?;
+                    Ok(acc + 1)
+                })?,
         };
         let sample_size = ((total as f64 * f).round() as usize).min(total);
 
@@ -98,7 +102,7 @@ pub fn fasta_sample(
 /// Reservoir sampling with fixed sample size (Algorithm R)
 fn reservoir_sample_count(
     input: &[u8],
-    mut output: impl Write,
+    output: impl Write,
     k: usize,
     rng: &mut SimpleRng,
     format: SeqFormat,
@@ -132,6 +136,7 @@ fn reservoir_sample_count(
         SeqFormat::Fastq => {
             let parser = FastqParser::new(input);
             for (i, entry) in parser.enumerate() {
+                let entry = entry?;
                 if i < k {
                     reservoir.push(StoredEntry::Fastq {
                         header: entry.header.to_vec(),
@@ -152,7 +157,43 @@ fn reservoir_sample_count(
         }
     }
 
-    // Write sampled entries
+    write_reservoir(reservoir, output)
+}
+
+fn reservoir_sample_count_fastq_stream(
+    mut parser: FastqStreamParser<impl Read>,
+    output: impl Write,
+    k: usize,
+    rng: &mut SimpleRng,
+) -> io::Result<()> {
+    if k == 0 {
+        return Ok(());
+    }
+    let mut reservoir: Vec<StoredEntry> = Vec::with_capacity(k);
+    let mut i = 0usize;
+    while let Some(entry) = parser.next_entry()? {
+        if i < k {
+            reservoir.push(StoredEntry::Fastq {
+                header: entry.header.clone(),
+                sequence: entry.sequence.clone(),
+                quality: entry.quality.clone(),
+            });
+        } else {
+            let j = rng.gen_range((i + 1) as u64) as usize;
+            if j < k {
+                reservoir[j] = StoredEntry::Fastq {
+                    header: entry.header.clone(),
+                    sequence: entry.sequence.clone(),
+                    quality: entry.quality.clone(),
+                };
+            }
+        }
+        i += 1;
+    }
+    write_reservoir(reservoir, output)
+}
+
+fn write_reservoir(reservoir: Vec<StoredEntry>, mut output: impl Write) -> io::Result<()> {
     for entry in reservoir {
         match entry {
             StoredEntry::Fasta { header, sequence } => {
@@ -223,29 +264,81 @@ fn main() {
         }
     }
 
-    let input = match get_input(args.input.as_deref()) {
-        Ok(input) => input,
-        Err(e) => {
-            eprintln!("Error reading input: {}", e);
-            process::exit(1);
+    let use_stream = matches!(args.input.as_deref(), None | Some("-"));
+
+    let result = if use_stream {
+        let output = match get_output(args.output.as_deref()) {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("Error opening output: {}", e);
+                process::exit(1);
+            }
+        };
+        let (format, mut reader) = match stdin_with_peek(8192) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Error reading input: {}", e);
+                process::exit(1);
+            }
+        };
+        let mut rng = SimpleRng::new(args.seed.unwrap_or(0));
+
+        match format {
+            SeqFormat::Fasta => {
+                let mut data = Vec::new();
+                if let Err(e) = reader.read_to_end(&mut data) {
+                    Err(e)
+                } else {
+                    fasta_sample(&data, output, args.count, args.fraction, args.seed)
+                }
+            }
+            SeqFormat::Fastq => {
+                if let Some(k) = args.count {
+                    reservoir_sample_count_fastq_stream(
+                        FastqStreamParser::new(reader),
+                        output,
+                        k,
+                        &mut rng,
+                    )
+                } else if args.fraction.is_some() {
+                    let mut data = Vec::new();
+                    if let Err(e) = reader.read_to_end(&mut data) {
+                        Err(e)
+                    } else {
+                        fasta_sample(&data, output, args.count, args.fraction, args.seed)
+                    }
+                } else {
+                    Ok(())
+                }
+            }
         }
+    } else {
+        let input = match get_input(args.input.as_deref()) {
+            Ok(input) => input,
+            Err(e) => {
+                eprintln!("Error reading input: {}", e);
+                process::exit(1);
+            }
+        };
+
+        let output = match get_output(args.output.as_deref()) {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("Error opening output: {}", e);
+                process::exit(1);
+            }
+        };
+
+        fasta_sample(
+            input.as_bytes(),
+            output,
+            args.count,
+            args.fraction,
+            args.seed,
+        )
     };
 
-    let output = match get_output(args.output.as_deref()) {
-        Ok(output) => output,
-        Err(e) => {
-            eprintln!("Error opening output: {}", e);
-            process::exit(1);
-        }
-    };
-
-    if let Err(e) = fasta_sample(
-        input.as_bytes(),
-        output,
-        args.count,
-        args.fraction,
-        args.seed,
-    ) {
+    if let Err(e) = result {
         if e.kind() == io::ErrorKind::BrokenPipe {
             process::exit(0);
         }
@@ -259,7 +352,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fasta_sample_count() {
+    fn sample_fasta_count() {
         let data = b">seq1\nACGT\n>seq2\nTGCA\n>seq3\nAAAA\n>seq4\nTTTT\n";
         let mut output = Vec::new();
         fasta_sample(data, &mut output, Some(2), None, Some(42)).unwrap();
@@ -270,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fasta_sample_fraction() {
+    fn sample_fasta_fraction() {
         let data = b">seq1\nACGT\n>seq2\nTGCA\n>seq3\nAAAA\n>seq4\nTTTT\n";
         let mut output = Vec::new();
         fasta_sample(data, &mut output, None, Some(0.5), Some(42)).unwrap();
@@ -281,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fasta_sample_deterministic() {
+    fn sample_fasta_deterministic() {
         let data = b">seq1\nACGT\n>seq2\nTGCA\n>seq3\nAAAA\n";
         let mut output1 = Vec::new();
         let mut output2 = Vec::new();
@@ -293,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fastq_sample_count() {
+    fn sample_fastq_count() {
         let data = b"@seq1\nACGT\n+\nIIII\n@seq2\nTGCA\n+\nHHHH\n@seq3\nAAAA\n+\nJJJJ\n";
         let mut output = Vec::new();
         fasta_sample(data, &mut output, Some(2), None, Some(42)).unwrap();

@@ -27,43 +27,44 @@ use shared::*;
 
 /// Interleave two FASTQ files
 pub fn fastq_interleave(r1_data: &[u8], r2_data: &[u8], mut output: impl Write) -> io::Result<()> {
-    let r1_parser = FastqParser::new(r1_data);
-    let r2_parser = FastqParser::new(r2_data);
+    let mut r1_parser = FastqParser::new(r1_data);
+    let mut r2_parser = FastqParser::new(r2_data);
 
-    let mut r1_count = 0;
-    let mut r2_count = 0;
+    loop {
+        let r1_next = r1_parser.next();
+        let r2_next = r2_parser.next();
 
-    for (entry1, entry2) in r1_parser.zip(r2_parser) {
-        // Write R1 entry
-        output.write_all(entry1.header)?;
-        output.write_all(b"\n")?;
-        output.write_all(entry1.sequence.as_bytes())?;
-        output.write_all(b"\n+\n")?;
-        output.write_all(entry1.quality)?;
-        output.write_all(b"\n")?;
+        match (r1_next, r2_next) {
+            (None, None) => break,
+            (Some(Err(e)), _) | (_, Some(Err(e))) => return Err(e),
+            (Some(Ok(entry1)), Some(Ok(entry2))) => {
+                output.write_all(entry1.header)?;
+                output.write_all(b"\n")?;
+                output.write_all(entry1.sequence.as_bytes())?;
+                output.write_all(b"\n+\n")?;
+                output.write_all(entry1.quality)?;
+                output.write_all(b"\n")?;
 
-        // Write R2 entry
-        output.write_all(entry2.header)?;
-        output.write_all(b"\n")?;
-        output.write_all(entry2.sequence.as_bytes())?;
-        output.write_all(b"\n+\n")?;
-        output.write_all(entry2.quality)?;
-        output.write_all(b"\n")?;
-
-        r1_count += 1;
-        r2_count += 1;
-    }
-
-    // Check if file lengths match
-    let remaining_r1: Vec<_> = FastqParser::new(r1_data).skip(r1_count).collect();
-    let remaining_r2: Vec<_> = FastqParser::new(r2_data).skip(r2_count).collect();
-
-    if !remaining_r1.is_empty() || !remaining_r2.is_empty() {
-        eprintln!(
-            "Warning: Read count mismatch - R1: {}, R2: {}",
-            r1_count + remaining_r1.len(),
-            r2_count + remaining_r2.len()
-        );
+                output.write_all(entry2.header)?;
+                output.write_all(b"\n")?;
+                output.write_all(entry2.sequence.as_bytes())?;
+                output.write_all(b"\n+\n")?;
+                output.write_all(entry2.quality)?;
+                output.write_all(b"\n")?;
+            }
+            (Some(Ok(_)), None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "FASTQ interleave mismatch: R1 has extra reads",
+                ))
+            }
+            (None, Some(Ok(_))) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "FASTQ interleave mismatch: R2 has extra reads",
+                ))
+            }
+        }
     }
 
     output.flush()?;
@@ -130,7 +131,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_interleave_basic() {
+    fn interleave_basic() {
         let r1 = b"@read1/1\nACGT\n+\nIIII\n@read2/1\nTGCA\n+\nHHHH\n";
         let r2 = b"@read1/2\nGGGG\n+\nJJJJ\n@read2/2\nCCCC\n+\nKKKK\n";
         let mut output = Vec::new();
@@ -145,5 +146,15 @@ mod tests {
         assert_eq!(lines[4], "@read1/2");
         assert_eq!(lines[8], "@read2/1");
         assert_eq!(lines[12], "@read2/2");
+    }
+
+    #[test]
+    fn interleave_mismatch_detected() {
+        // R2 missing final mate
+        let r1 = b"@r1/1\nAC\n+\nII\n@r2/1\nGG\n+\nII\n";
+        let r2 = b"@r1/2\nTT\n+\nII\n";
+        let mut output = Vec::new();
+        let err = fastq_interleave(r1, r2, &mut output).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

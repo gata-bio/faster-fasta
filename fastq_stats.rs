@@ -17,7 +17,7 @@
 //! fastq-stats reads.fastq --histogram
 //! ```
 
-use std::io;
+use std::io::{self, Read};
 use std::process;
 
 use clap::Parser;
@@ -35,6 +35,7 @@ struct FastqStats {
     quality_sum: u64,
     gc_count: u64,
     n_count: u64,
+    bin_size: usize,
     length_hist: [u64; 10], // 10 bins for length distribution
 }
 
@@ -49,6 +50,7 @@ impl FastqStats {
             quality_sum: 0,
             gc_count: 0,
             n_count: 0,
+            bin_size: 0,
             length_hist: [0; 10],
         }
     }
@@ -76,11 +78,11 @@ impl FastqStats {
         }
 
         // Length histogram (10 bins)
-        if self.max_length > 0 {
-            let bin_size = (self.max_length / 10).max(1);
-            let bin = ((len / bin_size).min(9)) as usize;
-            self.length_hist[bin] += 1;
+        if self.bin_size == 0 {
+            self.bin_size = (len / 10).max(1);
         }
+        let bin = ((len / self.bin_size).min(9)) as usize;
+        self.length_hist[bin] += 1;
     }
 
     fn mean_length(&self) -> f64 {
@@ -148,7 +150,7 @@ impl FastqStats {
             println!("Length Distribution");
             println!("-------------------");
             let max_count = *self.length_hist.iter().max().unwrap_or(&1);
-            let bin_size = (self.max_length / 10).max(1);
+            let bin_size = self.bin_size.max(1);
 
             for (i, &count) in self.length_hist.iter().enumerate() {
                 if count == 0 {
@@ -170,9 +172,22 @@ pub fn fastq_stats(input: &[u8], show_histogram: bool) -> io::Result<()> {
     let mut stats = FastqStats::new();
 
     for entry in parser {
+        let entry = entry?;
         stats.add_read(entry.sequence.as_bytes(), entry.quality);
     }
 
+    stats.print(show_histogram);
+    Ok(())
+}
+
+pub fn fastq_stats_stream(
+    mut parser: FastqStreamParser<impl Read>,
+    show_histogram: bool,
+) -> io::Result<()> {
+    let mut stats = FastqStats::new();
+    while let Some(entry) = parser.next_entry()? {
+        stats.add_read(&entry.sequence, &entry.quality);
+    }
     stats.print(show_histogram);
     Ok(())
 }
@@ -196,15 +211,21 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    let input = match get_input(args.input.as_deref()) {
-        Ok(input) => input,
-        Err(e) => {
-            eprintln!("Error reading input: {}", e);
-            process::exit(1);
+    let use_stream = matches!(args.input.as_deref(), None | Some("-"));
+
+    let result = if use_stream {
+        fastq_stats_stream(FastqStreamParser::new(io::stdin()), args.histogram)
+    } else {
+        match get_input(args.input.as_deref()) {
+            Ok(input) => fastq_stats(input.as_bytes(), args.histogram),
+            Err(e) => Err(e),
         }
     };
 
-    if let Err(e) = fastq_stats(input.as_bytes(), args.histogram) {
+    if let Err(e) = result {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            process::exit(0);
+        }
         eprintln!("Error processing FASTQ: {}", e);
         process::exit(1);
     }
@@ -215,14 +236,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_stats_basic() {
+    fn stats_basic() {
         let data = b"@seq1\nACGT\n+\nIIII\n@seq2\nACGTACGT\n+\nIIIIIIII\n";
         // Just ensure it doesn't crash
         fastq_stats(data, false).unwrap();
     }
 
     #[test]
-    fn test_stats_accumulation() {
+    fn stats_accumulation() {
         let mut stats = FastqStats::new();
         stats.add_read(b"ACGT", b"IIII");
         stats.add_read(b"ACGTACGT", b"IIIIIIII");

@@ -85,6 +85,7 @@ pub fn fasta_revcomp(input: &[u8], mut output: impl Write) -> io::Result<()> {
         SeqFormat::Fastq => {
             let parser = FastqParser::new(input);
             for entry in parser {
+                let entry = entry?;
                 let seq = entry.sequence.as_bytes();
                 let mut revcomp = vec![0u8; seq.len()];
                 lookup(&mut revcomp, seq, table);
@@ -157,7 +158,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_revcomp_simple() {
+    fn revcomp_simple() {
         let data = b">seq1\nACGT\n";
         let mut output = Vec::new();
         fasta_revcomp(data, &mut output).unwrap();
@@ -168,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn test_revcomp_palindrome() {
+    fn revcomp_palindrome() {
         let data = b">seq1\nGAATTC\n";
         let mut output = Vec::new();
         fasta_revcomp(data, &mut output).unwrap();
@@ -178,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn test_revcomp_multiple() {
+    fn revcomp_multiple() {
         let data = b">seq1\nAAAA\n>seq2\nTTTT\n>seq3\nGGGG\n>seq4\nCCCC\n";
         let mut output = Vec::new();
         fasta_revcomp(data, &mut output).unwrap();
@@ -192,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn test_revcomp_mixed_case() {
+    fn revcomp_mixed_case() {
         let data = b">seq1\nAcGt\n";
         let mut output = Vec::new();
         fasta_revcomp(data, &mut output).unwrap();
@@ -202,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn test_revcomp_with_n() {
+    fn revcomp_with_n() {
         let data = b">seq1\nACGTN\n";
         let mut output = Vec::new();
         fasta_revcomp(data, &mut output).unwrap();

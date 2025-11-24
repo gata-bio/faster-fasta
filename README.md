@@ -130,18 +130,18 @@ hyperfine \
     'fasta-dedup uniprot_sprot.fasta -o /tmp/ff.fasta' \
     'seqkit rmdup -s uniprot_sprot.fasta -o /tmp/seqkit.fasta' --warmup 1
 
-# FASTQ stats
+# Sorting by length: 0.8s vs 2.9s
 hyperfine \
-    'fastq-stats SRR25083113_1.fastq' \
-    'seqkit stats SRR25083113_1.fastq' --warmup 1
+    'fasta-sort --length SRR25083113_1.fastq -o /tmp/ff_sorted.fastq' \
+    'seqkit sort -l SRR25083113_1.fastq -o /tmp/seqkit_sorted.fastq' --warmup 1
 
 # Sampling (10% fraction): 0.17s vs 0.20s
 hyperfine \
     'fasta-sample SRR25083113_1.fastq --fraction 0.1 -o /tmp/ff_sample.fastq' \
     'seqkit sample -p 0.1 SRR25083113_1.fastq -o /tmp/seqkit_sample.fastq' --warmup 1
 
-# Sorting by length: 0.8s vs 2.9s
+# FASTQ stats
 hyperfine \
-    'fasta-sort --length SRR25083113_1.fastq -o /tmp/ff_sorted.fastq' \
-    'seqkit sort -l SRR25083113_1.fastq -o /tmp/seqkit_sorted.fastq' --warmup 1
+    'fastq-stats SRR25083113_1.fastq' \
+    'seqkit stats SRR25083113_1.fastq' --warmup 1
 ```

@@ -1,4 +1,4 @@
-![Faster FASTA Thumbnail](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/faster-fasta.jpg?raw=true)
+![Faster FASTA Thumbnail](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/FasterFASTA.jpg?raw=true)
 
 __Faster FASTA__ is a collection of command-line utilities for processing FASTA and FASTQ files, memory-mapped or streamed from external storage or via `stdin`.
 It's a faster SIMD-accelerated alternative to pure Go [`seqkit`](https://github.com/shenwei356/seqkit) and C++ [`fastp`](https://github.com/OpenGene/fastp) tools.

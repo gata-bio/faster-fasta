@@ -1,125 +1,159 @@
-//! Reverse complement utility for FASTA and FASTQ files
+//! Reverse complement of nucleotide sequences.
 //!
-//! Compute reverse complement of DNA sequences.
-//! Uses StringZilla's `lookup()` for SIMD-accelerated nucleotide translation.
-//! Supports standard and ambiguous IUPAC codes.
-//! Auto-detects format and preserves it (FASTQ quality scores are also reversed).
+//! Complements through a 256-byte lookup table and reverses in place. For FASTQ the
+//! quality string is reversed alongside the sequence, since position _n_ from the start
+//! becomes position _n_ from the end.
 //!
-//! **Memory**: O(1) - processes one sequence at a time
-//! **Streaming**: Yes - constant memory usage
+//! __Memory__: O(longest record) — one scratch buffer reused across every record.
+//! __Streaming__: yes, for files and pipes alike.
 //!
 //! # Examples
 //!
 //! ```bash
-//! # FASTA files
 //! fasta-revcomp sequences.fasta -o revcomp.fasta
-//!
-//! # FASTQ files (quality is also reversed)
 //! fasta-revcomp reads.fastq -o revcomp.fastq
-//!
-//! # Pipe composition
-//! cat sequences.fasta | fasta-revcomp | fasta-sort > sorted_revcomp.fasta
+//! cat sequences.fasta | fasta-revcomp | fasta-sort -l
 //! ```
 
 use std::io::{self, Write};
-use std::process;
 
 use clap::Parser;
-use stringzilla::sz::lookup;
+use stringzilla::sz::{find_byteset, lookup, Byteset};
 
-use faster_fasta::shared::*;
+use faster_fasta::{finish_or_exit, map_reduce, open_output, Record, Rendering, RecordWriter, SequenceFormat};
 
-/// Compute reverse complement of DNA sequences (FASTA or FASTQ)
+/// Complement table over the full IUPAC nucleotide alphabet, in both cases.
 ///
-/// Uses StringZilla's lookup() function for fast character mapping.
-/// Handles both uppercase and lowercase DNA bases.
-/// For FASTQ files, quality scores are also reversed to match the reversed sequence.
-pub fn fasta_revcomp(input: &[u8], mut output: impl Write) -> io::Result<()> {
-    let format = detect_format(input)?;
-
-    // StringZilla translation table for reverse complement
+/// Anything outside the alphabet maps to itself, so unexpected bytes survive a round trip
+/// rather than being silently rewritten.
+fn complement_table() -> [u8; 256] {
     let mut table = [0u8; 256];
-    for i in 0..256 {
-        table[i] = i as u8;
-    }
-    // Uppercase DNA bases
-    table[b'A' as usize] = b'T';
-    table[b'T' as usize] = b'A';
-    table[b'G' as usize] = b'C';
-    table[b'C' as usize] = b'G';
-    // Lowercase DNA bases
-    table[b'a' as usize] = b't';
-    table[b't' as usize] = b'a';
-    table[b'g' as usize] = b'c';
-    table[b'c' as usize] = b'g';
-    // Ambiguous bases
-    table[b'N' as usize] = b'N';
-    table[b'n' as usize] = b'n';
-    table[b'R' as usize] = b'Y';
-    table[b'Y' as usize] = b'R';
-    table[b'S' as usize] = b'S';
-    table[b'W' as usize] = b'W';
-    table[b'K' as usize] = b'M';
-    table[b'M' as usize] = b'K';
-    table[b'B' as usize] = b'V';
-    table[b'D' as usize] = b'H';
-    table[b'H' as usize] = b'D';
-    table[b'V' as usize] = b'B';
-
-    match format {
-        SeqFormat::Fasta => {
-            let parser = FastaParser::new(input);
-            for entry in parser {
-                let seq = entry.sequence.as_bytes();
-                let mut revcomp = vec![0u8; seq.len()];
-                lookup(&mut revcomp, seq, table);
-                revcomp.reverse();
-
-                output.write_all(entry.header)?;
-                output.write_all(b"\n")?;
-                output.write_all(&revcomp)?;
-                output.write_all(b"\n")?;
-            }
-        }
-        SeqFormat::Fastq => {
-            let parser = FastqParser::new(input);
-            for entry in parser {
-                let entry = entry?;
-                let seq = entry.sequence.as_bytes();
-                let mut revcomp = vec![0u8; seq.len()];
-                lookup(&mut revcomp, seq, table);
-                revcomp.reverse();
-
-                // Also reverse quality scores to match reversed sequence
-                let mut rev_quality = entry.quality.to_vec();
-                rev_quality.reverse();
-
-                output.write_all(entry.header)?;
-                output.write_all(b"\n")?;
-                output.write_all(&revcomp)?;
-                output.write_all(b"\n+\n")?;
-                output.write_all(&rev_quality)?;
-                output.write_all(b"\n")?;
-            }
-        }
+    for (index, entry) in table.iter_mut().enumerate() {
+        *entry = index as u8;
     }
 
-    output.flush()?;
-    Ok(())
+    // Unambiguous bases. Uracil is its own pair with adenine so RNA is an involution:
+    // complementing A back to T instead of U would silently transcribe RNA into DNA.
+    const PAIRS: &[(u8, u8)] = &[
+        (b'A', b'T'),
+        (b'T', b'A'),
+        (b'G', b'C'),
+        (b'C', b'G'),
+        // Ambiguity codes: each maps to the complement of its base set.
+        (b'R', b'Y'), // A/G  -> T/C
+        (b'Y', b'R'),
+        (b'S', b'S'), // G/C is self-complementary
+        (b'W', b'W'), // A/T is self-complementary
+        (b'K', b'M'), // G/T  -> C/A
+        (b'M', b'K'),
+        (b'B', b'V'), // not-A -> not-T
+        (b'V', b'B'),
+        (b'D', b'H'), // not-C -> not-G
+        (b'H', b'D'),
+        (b'N', b'N'),
+    ];
+
+    for &(base, complement) in PAIRS {
+        table[base as usize] = complement;
+        table[base.to_ascii_lowercase() as usize] = complement.to_ascii_lowercase();
+    }
+    table
 }
 
-/// Compute reverse complement of DNA sequences
+/// Complement table for RNA, where uracil takes thymine's place.
+///
+/// Chosen per record from whether the sequence contains any `T` or any `U`, so that
+/// reverse complementing is an involution on both alphabets.
+fn rna_complement_table() -> [u8; 256] {
+    let mut table = complement_table();
+    for (base, complement) in [(b'A', b'U'), (b'U', b'A')] {
+        table[base as usize] = complement;
+        table[base.to_ascii_lowercase() as usize] = complement.to_ascii_lowercase();
+    }
+    table
+}
+
+/// Uracil, whose presence without thymine marks a sequence as RNA.
+const URACIL: Byteset = Byteset::from_bytes(b"Uu");
+/// Thymine, whose presence marks a sequence as DNA even alongside uracil.
+const THYMINE: Byteset = Byteset::from_bytes(b"Tt");
+
+struct ReverseComplementer<W: Write> {
+    writer: RecordWriter<W>,
+    dna_table: [u8; 256],
+    rna_table: [u8; 256],
+    sequence_scratch: Vec<u8>,
+    quality_scratch: Vec<u8>,
+}
+
+impl<W: Write> ReverseComplementer<W> {
+    fn new(writer: W, format: SequenceFormat, rendering: Rendering) -> Self {
+        Self {
+            writer: RecordWriter::with_rendering(writer, rendering, format),
+            dna_table: complement_table(),
+            rna_table: rna_complement_table(),
+            sequence_scratch: Vec::new(),
+            quality_scratch: Vec::new(),
+        }
+    }
+}
+
+/// Grows `buffer` only when it is too short, so the zero-fill happens once rather than
+/// per record, and hands back exactly `length` bytes to overwrite.
+fn scratch_of(buffer: &mut Vec<u8>, length: usize) -> &mut [u8] {
+    if buffer.len() < length {
+        buffer.resize(length, 0);
+    }
+    &mut buffer[..length]
+}
+
+impl<W: Write> ReverseComplementer<W> {
+
+    fn push(&mut self, record: Record<'_>) -> io::Result<()> {
+        self.writer.adopt(record.format())?;
+        // Uracil standing in for thymine means RNA, where adenine must complement back to
+        // uracil. Thymine anywhere settles it as DNA.
+        let table = if find_byteset(record.sequence, URACIL).is_some()
+            && find_byteset(record.sequence, THYMINE).is_none()
+        {
+            self.rna_table
+        } else {
+            self.dna_table
+        };
+
+        let complemented = scratch_of(&mut self.sequence_scratch, record.sequence.len());
+        lookup(complemented, record.sequence, table);
+        complemented.reverse();
+
+        let reversed_quality = scratch_of(&mut self.quality_scratch, record.quality.len());
+        reversed_quality.copy_from_slice(record.quality);
+        reversed_quality.reverse();
+
+        self.writer.write_parts(
+            record.header_without_sigil(),
+            &self.sequence_scratch[..record.sequence.len()],
+            &self.quality_scratch[..record.quality.len()],
+        )
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+/// Reverse complement nucleotide sequences
 #[derive(Parser)]
 #[command(name = "fasta-revcomp")]
-#[command(version, about = "Compute reverse complement of DNA sequences")]
+#[command(version, about = "Reverse complement nucleotide sequences")]
 #[command(
-    long_about = "Compute reverse complement of DNA sequences from FASTA or FASTQ files.\nFor FASTQ, quality scores are also reversed to match the sequence orientation.\nAuto-detects format and preserves it in output."
+    long_about = "Reverse complement FASTA or FASTQ sequences over the full IUPAC alphabet.\nFor FASTQ the quality string is reversed to stay aligned with the sequence.\nSingle pass, works on files and pipes alike."
 )]
 struct Args {
-    /// Input file (FASTA or FASTQ, use '-' or omit for stdin)
-    input: Option<String>,
+    /// Input files, FASTA or FASTQ; '-' or omitted reads standard input
+    #[arg(default_value = "-")]
+    inputs: Vec<String>,
 
-    /// Output file (use '-' or omit for stdout)
+    /// Output file; '-' or omitted writes standard output
     #[arg(short, long)]
     output: Option<String>,
 }
@@ -127,87 +161,111 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    let input = match get_input(args.input.as_deref()) {
-        Ok(input) => input,
-        Err(e) => {
-            eprintln!("Error reading input: {}", e);
-            process::exit(1);
-        }
-    };
+    let result = (|| {
+        let rendering = Rendering::for_output(args.output.as_deref());
+        let output = open_output(args.output.as_deref())?;
+        // The placeholder format is replaced by `begin` before any record arrives.
+        let mut complementer = ReverseComplementer::new(output, SequenceFormat::Fasta, rendering);
+        map_reduce::for_each_record_at_paths(
+            &args.inputs,
+            &mut complementer,
+            ReverseComplementer::push,
+        )?;
+        complementer.finish()
+    })();
 
-    let output = match get_output(args.output.as_deref()) {
-        Ok(output) => output,
-        Err(e) => {
-            eprintln!("Error opening output: {}", e);
-            process::exit(1);
-        }
-    };
-
-    if let Err(e) = fasta_revcomp(input.as_bytes(), output) {
-        if e.kind() == io::ErrorKind::BrokenPipe {
-            process::exit(0);
-        }
-        eprintln!("Error processing sequences: {}", e);
-        process::exit(1);
-    }
+    finish_or_exit("Error reverse complementing", result);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn revcomp_simple() {
-        let data = b">seq1\nACGT\n";
-        let mut output = Vec::new();
-        fasta_revcomp(data, &mut output).unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains(">seq1"));
-        assert!(result.contains("ACGT"));
+    
+    fn revcomp(data: &[u8], format: SequenceFormat) -> String {
+        let mut complementer = ReverseComplementer::new(Vec::new(), format, Rendering::PLAIN);
+        map_reduce::for_each_record_in_bytes(data, &mut complementer, ReverseComplementer::push).unwrap();
+        String::from_utf8(complementer.writer.into_inner()).unwrap()
     }
 
     #[test]
-    fn revcomp_palindrome() {
-        let data = b">seq1\nGAATTC\n";
-        let mut output = Vec::new();
-        fasta_revcomp(data, &mut output).unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains("GAATTC"));
+    fn complements_and_reverses() {
+        assert_eq!(
+            revcomp(b">seq1\nACGT\n", SequenceFormat::Fasta),
+            ">seq1\nACGT\n"
+        );
+        assert_eq!(
+            revcomp(b">seq1\nAAAACGT\n", SequenceFormat::Fasta),
+            ">seq1\nACGTTTT\n"
+        );
     }
 
     #[test]
-    fn revcomp_multiple() {
-        let data = b">seq1\nAAAA\n>seq2\nTTTT\n>seq3\nGGGG\n>seq4\nCCCC\n";
-        let mut output = Vec::new();
-        fasta_revcomp(data, &mut output).unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        let lines: Vec<&str> = result.lines().collect();
-        assert_eq!(lines[1], "TTTT");
-        assert_eq!(lines[3], "AAAA");
-        assert_eq!(lines[5], "CCCC");
-        assert_eq!(lines[7], "GGGG");
+    fn preserves_case() {
+        assert_eq!(
+            revcomp(b">seq1\nacgtACGT\n", SequenceFormat::Fasta),
+            ">seq1\nACGTacgt\n"
+        );
     }
 
     #[test]
-    fn revcomp_mixed_case() {
-        let data = b">seq1\nAcGt\n";
-        let mut output = Vec::new();
-        fasta_revcomp(data, &mut output).unwrap();
+    fn handles_iupac_ambiguity_codes() {
+        // R is A/G, so its complement is Y for T/C; S and W are self-complementary.
+        assert_eq!(
+            revcomp(b">seq1\nRYSWKM\n", SequenceFormat::Fasta),
+            ">seq1\nKMWSRY\n"
+        );
+        assert_eq!(
+            revcomp(b">seq1\nBDHVN\n", SequenceFormat::Fasta),
+            ">seq1\nNBDHV\n"
+        );
+    }
 
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains("aCgT"));
+    /// The FASTQ path had no test at all previously, so this is the first coverage of
+    /// quality reversal.
+    #[test]
+    fn reverses_quality_alongside_sequence() {
+        assert_eq!(
+            revcomp(b"@seq1\nACGT\n+\n!#$%\n", SequenceFormat::Fastq),
+            "@seq1\nACGT\n+\n%$#!\n"
+        );
+    }
+
+    /// Complementing twice must return the input for RNA as well as DNA. Mapping uracil to
+    /// adenine while adenine mapped to thymine silently transcribed RNA into DNA.
+    #[test]
+    fn rna_round_trips_without_becoming_dna() {
+        let original = ">seq1\nAUGCUUAA\n";
+        let once = revcomp(original.as_bytes(), SequenceFormat::Fasta);
+        let twice = revcomp(once.as_bytes(), SequenceFormat::Fasta);
+        assert_eq!(twice, original, "one pass gave {once}");
+        assert!(!once.contains('T'), "RNA gained a thymine: {once}");
     }
 
     #[test]
-    fn revcomp_with_n() {
-        let data = b">seq1\nACGTN\n";
-        let mut output = Vec::new();
-        fasta_revcomp(data, &mut output).unwrap();
+    fn round_trips_to_the_original() {
+        let original = b">seq1\nACGTTGCANNRY\n";
+        let once = revcomp(original, SequenceFormat::Fasta);
+        let twice = revcomp(once.as_bytes(), SequenceFormat::Fasta);
+        assert_eq!(twice, String::from_utf8(original.to_vec()).unwrap());
+    }
 
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains("NACGT"));
+    #[test]
+    fn joins_wrapped_sequences() {
+        assert_eq!(
+            revcomp(b">seq1\nAAAA\nCGT\n", SequenceFormat::Fasta),
+            ">seq1\nACGTTTT\n"
+        );
+    }
+
+    #[test]
+    fn scratch_is_reused_across_records() {
+        let data = b">a\nACGT\n>b\nACGTACGT\n>c\nAC\n";
+        let mut complementer = ReverseComplementer::new(Vec::new(), SequenceFormat::Fasta, Rendering::PLAIN);
+        map_reduce::for_each_record_in_bytes(
+            data,
+            &mut complementer,
+            ReverseComplementer::push).unwrap();
+        // Sized to the longest record, never to the sum of them.
+        assert_eq!(complementer.sequence_scratch.len(), 8);
     }
 }

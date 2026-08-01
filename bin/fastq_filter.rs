@@ -1,173 +1,156 @@
-//! FASTQ quality filtering utility
+//! Quality, length, and N-content filtering.
 //!
-//! Filter FASTQ reads based on quality scores, length, and N-content.
-//! Streaming implementation with O(1) memory usage.
+//! Criteria combine with AND: a record is kept only if it satisfies every one supplied.
 //!
-//! **Memory**: O(1) - processes one read at a time
-//! **Streaming**: Yes - no materialization required
+//! __Memory__: O(1) — no per-record allocation.
+//! __Streaming__: yes, for files and pipes alike.
 //!
 //! # Examples
 //!
 //! ```bash
-//! # Filter by minimum mean quality
-//! fastq-filter reads.fastq --min-quality 20 -o filtered.fastq
-//!
-//! # Filter by length range and N-content
-//! fastq-filter reads.fastq --min-length 50 --max-n-fraction 0.1 -o filtered.fastq
-//!
-//! # Multiple filters (AND logic)
-//! fastq-filter reads.fastq --min-quality 25 --min-length 75 --max-length 150 -o filtered.fastq
+//! fastq-filter reads.fastq -q 25 -l 75 -o filtered.fastq
+//! fastq-filter reads.fastq -n 0.05 -o low_ambiguity.fastq
+//! cat reads.fastq | fastq-filter -q 30 > filtered.fastq
 //! ```
 
-use std::io::{self, Read, Write};
-use std::process;
+use std::io::{self, Write};
 
 use clap::Parser;
 
-use faster_fasta::shared::*;
+use faster_fasta::{finish_or_exit, map_reduce, mean_quality, open_output, Record, Rendering, RecordWriter, SequenceFormat};
 
-/// Filter FASTQ reads based on quality and content criteria
-///
-/// Applies multiple filter criteria with AND logic: a read passes only if it meets ALL criteria.
-/// Uses streaming to process one read at a time with minimal memory usage.
-pub fn fastq_filter(
-    input: &[u8],
-    mut output: impl Write,
-    min_quality: Option<f32>,
-    min_length: Option<usize>,
-    max_length: Option<usize>,
-    max_n_fraction: Option<f32>,
-) -> io::Result<()> {
-    let parser = FastqParser::new(input);
-
-    for entry in parser {
-        let entry = entry?;
-        let seq = entry.sequence.as_bytes();
-        let qual = entry.quality;
-
-        // Filter by mean quality
-        if let Some(min_q) = min_quality {
-            if quality::mean_quality(qual) < min_q {
-                continue;
-            }
-        }
-
-        // Filter by length
-        let seq_len = seq.len();
-        if let Some(min_len) = min_length {
-            if seq_len < min_len {
-                continue;
-            }
-        }
-        if let Some(max_len) = max_length {
-            if seq_len > max_len {
-                continue;
-            }
-        }
-
-        // Filter by N-base content
-        if let Some(max_n) = max_n_fraction {
-            let n_count = seq.iter().filter(|&&b| b == b'N' || b == b'n').count();
-            let n_frac = n_count as f32 / seq_len as f32;
-            if n_frac > max_n {
-                continue;
-            }
-        }
-
-        // Read passed all filters - write it
-        output.write_all(entry.header)?;
-        output.write_all(b"\n")?;
-        output.write_all(seq)?;
-        output.write_all(b"\n+\n")?;
-        output.write_all(qual)?;
-        output.write_all(b"\n")?;
-    }
-
-    output.flush()?;
-    Ok(())
+/// Every criterion is optional; a `None` never rejects anything.
+#[derive(Debug, Clone, Copy, Default)]
+struct Criteria {
+    minimum_quality: Option<f32>,
+    minimum_length: Option<usize>,
+    maximum_length: Option<usize>,
+    maximum_n_fraction: Option<f32>,
 }
 
-fn fastq_filter_stream(
-    mut parser: FastqStreamParser<impl Read>,
-    mut output: impl Write,
-    min_quality: Option<f32>,
-    min_length: Option<usize>,
-    max_length: Option<usize>,
-    max_n_fraction: Option<f32>,
-) -> io::Result<()> {
-    while let Some(entry) = parser.next_entry()? {
-        let seq = entry.sequence.as_slice();
-        let qual = entry.quality.as_slice();
-
-        if let Some(min_q) = min_quality {
-            if quality::mean_quality(qual) < min_q {
-                continue;
+impl Criteria {
+    /// Bounds that exclude each other would silently drop every record.
+    fn validate(&self) -> io::Result<()> {
+        if let Some(fraction) = self.maximum_n_fraction {
+            if !(0.0..=1.0).contains(&fraction) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("--max-n-fraction must be between 0.0 and 1.0, got {fraction}"),
+                ));
             }
         }
-
-        let seq_len = seq.len();
-        if let Some(min_len) = min_length {
-            if seq_len < min_len {
-                continue;
+        if let (Some(minimum), Some(maximum)) = (self.minimum_length, self.maximum_length) {
+            if minimum > maximum {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("--min-length {minimum} exceeds --max-length {maximum}, so no record can pass"),
+                ));
             }
         }
-        if let Some(max_len) = max_length {
-            if seq_len > max_len {
-                continue;
-            }
-        }
-
-        if let Some(max_n) = max_n_fraction {
-            let n_count = seq.iter().filter(|&&b| b == b'N' || b == b'n').count();
-            let n_frac = n_count as f32 / seq_len as f32;
-            if n_frac > max_n {
-                continue;
-            }
-        }
-
-        output.write_all(&entry.header)?;
-        output.write_all(b"\n")?;
-        output.write_all(seq)?;
-        output.write_all(b"\n+\n")?;
-        output.write_all(qual)?;
-        output.write_all(b"\n")?;
+        Ok(())
     }
 
-    output.flush()?;
-    Ok(())
+    fn accepts(&self, record: &Record<'_>) -> bool {
+        if let Some(threshold) = self.minimum_quality {
+            if mean_quality(record.quality) < threshold {
+                return false;
+            }
+        }
+
+        let length = record.sequence.len();
+        if self.minimum_length.is_some_and(|minimum| length < minimum) {
+            return false;
+        }
+        if self.maximum_length.is_some_and(|maximum| length > maximum) {
+            return false;
+        }
+
+        if let Some(maximum) = self.maximum_n_fraction {
+            // An empty sequence has no ambiguous bases, so it cannot exceed any bound.
+            if length > 0 {
+                let ambiguous = record
+                    .sequence
+                    .iter()
+                    .filter(|&&base| base == b'N' || base == b'n')
+                    .count();
+                if ambiguous as f32 / length as f32 > maximum {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
 }
 
-/// Filter FASTQ reads by quality and content
+struct Filter<W: Write> {
+    writer: RecordWriter<W>,
+    criteria: Criteria,
+    examined: usize,
+    retained: usize,
+}
+
+impl<W: Write> Filter<W> {
+    fn new(writer: W, criteria: Criteria, rendering: Rendering) -> Self {
+        Self {
+            writer: RecordWriter::with_rendering(writer, rendering, SequenceFormat::Fastq),
+            criteria,
+            examined: 0,
+            retained: 0,
+        }
+    }
+
+    fn push(&mut self, record: Record<'_>) -> io::Result<()> {
+        if record.format() == SequenceFormat::Fasta && self.criteria.minimum_quality.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--min-quality needs FASTQ input, but this input is FASTA",
+            ));
+        }
+        self.writer.adopt(record.format())?;
+        self.examined += 1;
+        if !self.criteria.accepts(&record) {
+            return Ok(());
+        }
+        self.writer.write_record(record)?;
+        self.retained += 1;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+/// Filter records by quality, length, and ambiguity
 #[derive(Parser)]
 #[command(name = "fastq-filter")]
+#[command(version, about = "Filter records by quality, length, and N-content")]
 #[command(
-    version,
-    about = "Filter FASTQ reads by quality, length, and N-content"
-)]
-#[command(
-    long_about = "Filter FASTQ reads based on quality scores, length, and N-base content.\nAll filters use AND logic: reads must pass ALL criteria.\nStreaming implementation with minimal memory usage."
+    long_about = "Filter FASTQ or FASTA records on mean quality, length bounds, and N-base fraction.\nCriteria combine with AND: a record is kept only if it satisfies every one given.\nSingle pass, constant memory, works on files and pipes alike."
 )]
 struct Args {
-    /// Input FASTQ file (use '-' or omit for stdin)
-    input: Option<String>,
+    /// Input files; '-' or omitted reads standard input
+    #[arg(default_value = "-")]
+    inputs: Vec<String>,
 
-    /// Output FASTQ file (use '-' or omit for stdout)
+    /// Output file; '-' or omitted writes standard output
     #[arg(short, long)]
     output: Option<String>,
 
-    /// Minimum mean quality score (Phred scale)
+    /// Minimum mean Phred quality
     #[arg(short = 'q', long)]
     min_quality: Option<f32>,
 
-    /// Minimum read length
+    /// Minimum sequence length
     #[arg(short = 'l', long)]
     min_length: Option<usize>,
 
-    /// Maximum read length
+    /// Maximum sequence length
     #[arg(short = 'L', long)]
     max_length: Option<usize>,
 
-    /// Maximum fraction of N-bases (0.0-1.0)
+    /// Maximum fraction of N bases, between 0.0 and 1.0
     #[arg(short = 'n', long)]
     max_n_fraction: Option<f32>,
 }
@@ -175,123 +158,161 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    // Validate max_n_fraction if provided
-    if let Some(f) = args.max_n_fraction {
-        if f < 0.0 || f > 1.0 {
-            eprintln!("Error: max-n-fraction must be between 0.0 and 1.0");
-            process::exit(1);
-        }
-    }
+    let criteria = Criteria {
+        minimum_quality: args.min_quality,
+        minimum_length: args.min_length,
+        maximum_length: args.max_length,
+        maximum_n_fraction: args.max_n_fraction,
+    };
 
-    let use_stream = matches!(args.input.as_deref(), None | Some("-"));
+    let result = (|| {
+        // Config is checked before any input is opened, so a contradiction fails at once.
+        criteria.validate()?;
+        let rendering = Rendering::for_output(args.output.as_deref());
+        let output = open_output(args.output.as_deref())?;
+        let mut filter = Filter::new(output, criteria, rendering);
+        map_reduce::for_each_record_at_paths(
+            &args.inputs,
+            &mut filter,
+            Filter::push,
+        )?;
+        filter.finish()
+    })();
 
-    if use_stream {
-        let output = match get_output(args.output.as_deref()) {
-            Ok(output) => output,
-            Err(e) => {
-                eprintln!("Error opening output: {}", e);
-                process::exit(1);
-            }
-        };
-
-        if let Err(e) = fastq_filter_stream(
-            FastqStreamParser::new(io::stdin()),
-            output,
-            args.min_quality,
-            args.min_length,
-            args.max_length,
-            args.max_n_fraction,
-        ) {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                process::exit(0);
-            }
-            eprintln!("Error processing FASTQ: {}", e);
-            process::exit(1);
-        }
-    } else {
-        let input = match get_input(args.input.as_deref()) {
-            Ok(input) => input,
-            Err(e) => {
-                eprintln!("Error reading input: {}", e);
-                process::exit(1);
-            }
-        };
-
-        let output = match get_output(args.output.as_deref()) {
-            Ok(output) => output,
-            Err(e) => {
-                eprintln!("Error opening output: {}", e);
-                process::exit(1);
-            }
-        };
-
-        if let Err(e) = fastq_filter(
-            input.as_bytes(),
-            output,
-            args.min_quality,
-            args.min_length,
-            args.max_length,
-            args.max_n_fraction,
-        ) {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                process::exit(0);
-            }
-            eprintln!("Error processing FASTQ: {}", e);
-            process::exit(1);
-        }
-    }
+    finish_or_exit("Error filtering records", result);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A FASTA record has no quality, so a mean-quality threshold would silently reject
+    /// every record and exit successfully. It is an error instead.
     #[test]
-    fn filter_by_quality() {
-        // Quality: IIII = Q40, HHHH = Q39, !!!! = Q0
-        let data = b"@seq1\nACGT\n+\nIIII\n@seq2\nTGCA\n+\nHHHH\n@seq3\nAAAA\n+\n!!!!\n";
-        let mut output = Vec::new();
-        fastq_filter(&data[..], &mut output, Some(20.0), None, None, None).unwrap();
+    fn quality_threshold_on_fasta_is_rejected() {
+        let criteria = Criteria { minimum_quality: Some(30.0), ..Default::default() };
+        let mut tool = Filter::new(Vec::new(), criteria, Rendering::PLAIN);
+        let error = map_reduce::for_each_record_in_bytes(b">a\nACGT\n>b\nTTTT\n", &mut tool, Filter::push)
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("--min-quality"), "{error}");
+    }
+    
+    fn filter(data: &[u8], criteria: Criteria) -> String {
+        let mut filter = Filter::new(Vec::new(), criteria, Rendering::PLAIN);
+        map_reduce::for_each_record_in_bytes(
+            data,
+            &mut filter,
+            Filter::push).unwrap();
+        String::from_utf8(filter.writer.into_inner()).unwrap()
+    }
 
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains("@seq1"));
-        assert!(result.contains("@seq2"));
-        assert!(!result.contains("@seq3")); // Low quality filtered
+    /// 'I' is Q40, '#' is Q2.
+    const MIXED: &[u8] = b"@high\nACGT\n+\nIIII\n@low\nTGCA\n+\n####\n";
+
+    #[test]
+    fn filters_by_mean_quality() {
+        let criteria = Criteria {
+            minimum_quality: Some(30.0),
+            ..Default::default()
+        };
+        assert_eq!(filter(MIXED, criteria), "@high\nACGT\n+\nIIII\n");
     }
 
     #[test]
-    fn filter_by_length() {
-        let data = b"@seq1\nACGT\n+\nIIII\n@seq2\nAA\n+\nII\n@seq3\nACGTACGT\n+\nIIIIIIII\n";
-        let mut output = Vec::new();
-        fastq_filter(&data[..], &mut output, None, Some(4), Some(6), None).unwrap();
+    fn filters_by_length_bounds() {
+        let data = b"@short\nAC\n+\nII\n@medium\nACGT\n+\nIIII\n@long\nACGTACGT\n+\nIIIIIIII\n";
+        let minimum = Criteria {
+            minimum_length: Some(4),
+            ..Default::default()
+        };
+        assert!(!filter(data, minimum).contains("@short"));
+        assert!(filter(data, minimum).contains("@medium"));
 
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains("@seq1")); // Length 4: passes
-        assert!(!result.contains("@seq2")); // Length 2: too short
-        assert!(!result.contains("@seq3")); // Length 8: too long
+        let maximum = Criteria {
+            maximum_length: Some(4),
+            ..Default::default()
+        };
+        assert!(!filter(data, maximum).contains("@long"));
+        assert!(filter(data, maximum).contains("@medium"));
     }
 
     #[test]
-    fn filter_by_n_content() {
-        let data = b"@seq1\nACGT\n+\nIIII\n@seq2\nNNNN\n+\nIIII\n@seq3\nACNT\n+\nIIII\n";
-        let mut output = Vec::new();
-        fastq_filter(&data[..], &mut output, None, None, None, Some(0.5)).unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains("@seq1")); // 0% N: passes
-        assert!(!result.contains("@seq2")); // 100% N: fails
-        assert!(result.contains("@seq3")); // 25% N: passes (< 50%)
+    fn filters_by_ambiguity_fraction() {
+        // Half the bases are N in the second record.
+        let data = b"@clean\nACGT\n+\nIIII\n@murky\nACNN\n+\nIIII\n";
+        let criteria = Criteria {
+            maximum_n_fraction: Some(0.25),
+            ..Default::default()
+        };
+        let kept = filter(data, criteria);
+        assert!(kept.contains("@clean"));
+        assert!(!kept.contains("@murky"));
     }
 
     #[test]
-    fn filter_multiple() {
-        let data = b"@seq1\nACGT\n+\nIIII\n@seq2\nAC\n+\nII\n@seq3\nACGT\n+\n!!!!\n";
-        let mut output = Vec::new();
-        fastq_filter(&data[..], &mut output, Some(20.0), Some(4), None, None).unwrap();
+    fn criteria_combine_with_and() {
+        let data = b"@a\nACGT\n+\nIIII\n@b\nAC\n+\nII\n@c\nACGT\n+\n####\n";
+        let criteria = Criteria {
+            minimum_quality: Some(30.0),
+            minimum_length: Some(4),
+            ..Default::default()
+        };
+        // Only `a` satisfies both.
+        assert_eq!(filter(data, criteria), "@a\nACGT\n+\nIIII\n");
+    }
 
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains("@seq1")); // Passes both filters
-        assert!(!result.contains("@seq2")); // Fails length
-        assert!(!result.contains("@seq3")); // Fails quality
+    #[test]
+    fn no_criteria_keeps_everything() {
+        assert_eq!(filter(MIXED, Criteria::default()), String::from_utf8(MIXED.to_vec()).unwrap());
+    }
+
+    #[test]
+    fn contradictory_length_bounds_are_rejected() {
+        let criteria = Criteria {
+            minimum_length: Some(100),
+            maximum_length: Some(50),
+            ..Default::default()
+        };
+        let error = criteria.validate().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("no record can pass"), "{error}");
+    }
+
+    #[test]
+    fn ambiguity_fraction_outside_the_unit_range_is_rejected() {
+        let criteria = Criteria {
+            maximum_n_fraction: Some(1.5),
+            ..Default::default()
+        };
+        assert_eq!(
+            criteria.validate().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// An empty sequence must not divide by zero when an ambiguity bound is set.
+    #[test]
+    fn empty_sequence_survives_ambiguity_check() {
+        let criteria = Criteria {
+            maximum_n_fraction: Some(0.1),
+            ..Default::default()
+        };
+        assert_eq!(filter(b"@empty\n\n+\n\n", criteria), "@empty\n\n+\n\n");
+    }
+
+    #[test]
+    fn counts_are_tracked() {
+        let criteria = Criteria {
+            minimum_quality: Some(30.0),
+            ..Default::default()
+        };
+        let mut filter = Filter::new(Vec::new(), criteria, Rendering::PLAIN);
+        map_reduce::for_each_record_in_bytes(
+            MIXED,
+            &mut filter,
+            Filter::push).unwrap();
+        assert_eq!(filter.examined, 2);
+        assert_eq!(filter.retained, 1);
     }
 }

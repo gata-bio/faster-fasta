@@ -1,182 +1,177 @@
-//! FASTQ trimming utility
+//! Quality-based and fixed-position read trimming.
 //!
-//! Trim reads based on quality scores or fixed positions.
-//! Streaming implementation with O(1) memory usage.
+//! Low-quality bases are trimmed from both ends, then fixed offsets are removed, then the
+//! result is capped to a maximum length. Records shorter than a minimum after trimming are
+//! dropped.
 //!
-//! **Memory**: O(1) - processes one read at a time
-//! **Streaming**: Yes - no materialization required
+//! __Memory__: O(1) — trimming resolves to a byte range, so nothing is copied. The previous
+//! implementation allocated two vectors per record, before the minimum-length filter could
+//! reject the record and discard them.
+//! __Streaming__: yes, for files and pipes alike.
 //!
 //! # Examples
 //!
 //! ```bash
-//! # Trim low-quality ends
-//! fastq-trim reads.fastq --quality-cutoff 20 -o trimmed.fastq
-//!
-//! # Fixed-length trimming
-//! fastq-trim reads.fastq --trim-front 5 --trim-tail 10 -o trimmed.fastq
-//!
-//! # Truncate to max length and filter short reads
-//! fastq-trim reads.fastq --max-length 100 --min-length 50 -o trimmed.fastq
+//! fastq-trim reads.fastq -q 20 -t 5 -l 50 -o trimmed.fastq
+//! fastq-trim reads.fastq -f 10 -L 100 -o trimmed.fastq
+//! cat reads.fastq | fastq-trim -q 20 > trimmed.fastq
 //! ```
 
-use std::io::{self, Read, Write};
-use std::process;
+use std::io::{self, Write};
+use std::ops::Range;
 
 use clap::Parser;
 
-use faster_fasta::shared::*;
+use stringzilla::sz::{find_byteset, rfind_byteset, Byteset};
 
-/// Trim a read based on various criteria
-fn trim_read(
-    seq: &[u8],
-    qual: &[u8],
-    quality_cutoff: Option<u8>,
+use faster_fasta::{
+    finish_or_exit, map_reduce, open_output, phred33_to_ascii, Record, RecordWriter, Rendering,
+    SequenceFormat,
+};
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TrimSettings {
+    /// Quality bytes at or above the cutoff, or `None` to leave quality alone.
+    ///
+    /// The set rather than the cutoff, so there is no derived field to fall out of step with
+    /// its source, and so the scan does not rebuild it per record.
+    acceptable_scores: Option<Byteset>,
     trim_front: usize,
     trim_tail: usize,
-    max_length: Option<usize>,
-) -> (Vec<u8>, Vec<u8>) {
-    let mut start = 0;
-    let mut end = seq.len();
-
-    // Quality-based trimming (trim from both ends until quality >= cutoff)
-    if let Some(cutoff) = quality_cutoff {
-        // Trim front
-        while start < end && quality::ascii_to_phred33(qual[start]) < cutoff {
-            start += 1;
-        }
-
-        // Trim tail
-        while end > start && quality::ascii_to_phred33(qual[end - 1]) < cutoff {
-            end -= 1;
-        }
-    }
-
-    // Fixed-position trimming
-    start += trim_front;
-    if end > trim_tail {
-        end -= trim_tail;
-    } else {
-        end = start; // Read becomes empty
-    }
-
-    // Ensure start doesn't exceed end
-    start = start.min(end).min(seq.len());
-    end = end.min(seq.len());
-
-    // Truncate to max length
-    if let Some(max_len) = max_length {
-        end = end.min(start + max_len);
-    }
-
-    let trimmed_seq = seq[start..end].to_vec();
-    let trimmed_qual = qual[start..end].to_vec();
-
-    (trimmed_seq, trimmed_qual)
+    maximum_length: Option<usize>,
+    minimum_length: Option<usize>,
 }
 
-/// Trim FASTQ reads
-pub fn fastq_trim(
-    input: &[u8],
-    mut output: impl Write,
-    quality_cutoff: Option<u8>,
-    trim_front: usize,
-    trim_tail: usize,
-    max_length: Option<usize>,
-    min_length: Option<usize>,
-) -> io::Result<()> {
-    let parser = FastqParser::new(input);
-
-    for entry in parser {
-        let entry = entry?;
-        let seq = entry.sequence.as_bytes();
-        let qual = entry.quality;
-
-        let (trimmed_seq, trimmed_qual) =
-            trim_read(seq, qual, quality_cutoff, trim_front, trim_tail, max_length);
-
-        // Filter by minimum length
-        if let Some(min_len) = min_length {
-            if trimmed_seq.len() < min_len {
-                continue;
-            }
-        }
-
-        // Write trimmed read
-        output.write_all(entry.header)?;
-        output.write_all(b"\n")?;
-        output.write_all(&trimmed_seq)?;
-        output.write_all(b"\n+\n")?;
-        output.write_all(&trimmed_qual)?;
-        output.write_all(b"\n")?;
+/// Every byte encoding a Phred score at or above `cutoff`.
+fn acceptable_scores(cutoff: u8) -> Byteset {
+    let mut set = Byteset::new();
+    for score in cutoff..=93 {
+        set.add_u8(phred33_to_ascii(score));
     }
-
-    output.flush()?;
-    Ok(())
+    set
 }
 
-fn fastq_trim_stream(
-    mut parser: FastqStreamParser<impl Read>,
-    mut output: impl Write,
-    quality_cutoff: Option<u8>,
-    trim_front: usize,
-    trim_tail: usize,
-    max_length: Option<usize>,
-    min_length: Option<usize>,
-) -> io::Result<()> {
-    while let Some(entry) = parser.next_entry()? {
-        let (trimmed_seq, trimmed_qual) =
-            trim_read(&entry.sequence, &entry.quality, quality_cutoff, trim_front, trim_tail, max_length);
+impl TrimSettings {
+    /// The surviving byte range, as an offset into both sequence and quality.
+    ///
+    /// Returning a range rather than owned buffers is the whole optimization: a record
+    /// that the minimum-length filter will reject costs nothing but arithmetic.
+    fn range(&self, record: &Record<'_>) -> Range<usize> {
+        let mut start = 0usize;
+        let mut end = record.sequence.len();
 
-        if let Some(min_len) = min_length {
-            if trimmed_seq.len() < min_len {
-                continue;
-            }
+        // Trimming to the first and last acceptable base is what a byteset scan computes.
+        // The bound is the quality length, not the sequence length: a FASTA record carries
+        // no quality, and indexing it by a sequence offset would run off the end.
+        if let Some(acceptable) = self.acceptable_scores {
+            let scores = &record.quality[..end.min(record.quality.len())];
+            start = find_byteset(scores, acceptable).unwrap_or(scores.len());
+            end = rfind_byteset(scores, acceptable).map_or(start, |last| last + 1);
         }
 
-        output.write_all(&entry.header)?;
-        output.write_all(b"\n")?;
-        output.write_all(&trimmed_seq)?;
-        output.write_all(b"\n+\n")?;
-        output.write_all(&trimmed_qual)?;
-        output.write_all(b"\n")?;
+        start = start.saturating_add(self.trim_front);
+        end = end.saturating_sub(self.trim_tail);
+
+        start = start.min(record.sequence.len());
+        end = end.clamp(start, record.sequence.len());
+
+        if let Some(maximum) = self.maximum_length {
+            end = end.min(start.saturating_add(maximum));
+        }
+
+        start..end
     }
 
-    output.flush()?;
-    Ok(())
+    fn keeps(&self, length: usize) -> bool {
+        !self.minimum_length.is_some_and(|minimum| length < minimum)
+    }
 }
 
-/// Trim FASTQ reads by quality or position
+struct Trimmer<W: Write> {
+    writer: RecordWriter<W>,
+    settings: TrimSettings,
+    examined: usize,
+    retained: usize,
+}
+
+impl<W: Write> Trimmer<W> {
+    fn new(writer: W, settings: TrimSettings, rendering: Rendering) -> Self {
+        Self {
+            writer: RecordWriter::with_rendering(writer, rendering, SequenceFormat::Fastq),
+            settings,
+            examined: 0,
+            retained: 0,
+        }
+    }
+
+    fn push(&mut self, record: Record<'_>) -> io::Result<()> {
+        if record.format() == SequenceFormat::Fasta && self.settings.acceptable_scores.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--quality-cutoff needs FASTQ input, but this input is FASTA",
+            ));
+        }
+        self.writer.adopt(record.format())?;
+        self.examined += 1;
+        let range = self.settings.range(&record);
+        if !self.settings.keeps(range.len()) {
+            return Ok(());
+        }
+
+        // Quality is empty for FASTA, so it cannot be sliced by the same range.
+        let trimmed_quality = if record.quality.is_empty() {
+            &[][..]
+        } else {
+            &record.quality[range.clone()]
+        };
+
+        self.writer.write_parts(
+            record.header_without_sigil(),
+            &record.sequence[range],
+            trimmed_quality,
+        )?;
+        self.retained += 1;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+/// Trim reads by quality and position
 #[derive(Parser)]
 #[command(name = "fastq-trim")]
-#[command(version, about = "Trim FASTQ reads by quality or position")]
+#[command(version, about = "Trim reads by quality and fixed position")]
 #[command(
-    long_about = "Trim FASTQ reads based on quality scores or fixed positions.\nMultiple trimming operations applied in order: quality → front → tail → max-length.\nReads shorter than min-length after trimming are discarded."
+    long_about = "Trim FASTQ reads from both ends.\nLow-quality bases go first, then fixed offsets, then a maximum-length cap.\nReads shorter than the minimum after trimming are dropped."
 )]
 struct Args {
-    /// Input FASTQ file (use '-' or omit for stdin)
-    input: Option<String>,
+    /// Input files; '-' or omitted reads standard input
+    #[arg(default_value = "-")]
+    inputs: Vec<String>,
 
-    /// Output FASTQ file (use '-' or omit for stdout)
+    /// Output file; '-' or omitted writes standard output
     #[arg(short, long)]
     output: Option<String>,
 
-    /// Quality cutoff (trim ends until quality >= cutoff)
+    /// Trim bases below this Phred score from both ends
     #[arg(short = 'q', long)]
     quality_cutoff: Option<u8>,
 
-    /// Remove N bases from front
-    #[arg(short = 'f', long, default_value = "0")]
+    /// Bases to remove from the start of every read
+    #[arg(short = 'f', long, default_value_t = 0)]
     trim_front: usize,
 
-    /// Remove N bases from tail
-    #[arg(short = 't', long, default_value = "0")]
+    /// Bases to remove from the end of every read
+    #[arg(short = 't', long, default_value_t = 0)]
     trim_tail: usize,
 
-    /// Truncate to maximum length
-    #[arg(short = 'L', long)]
-    max_length: Option<usize>,
+    /// Truncate reads longer than this, keeping the leading bases
+    #[arg(short = 'T', long)]
+    truncate_to: Option<usize>,
 
-    /// Discard reads shorter than minimum length (after trimming)
+    /// Drop reads shorter than this after trimming
     #[arg(short = 'l', long)]
     min_length: Option<usize>,
 }
@@ -184,98 +179,179 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    let use_stream = matches!(args.input.as_deref(), None | Some("-"));
+    let settings = TrimSettings {
+        acceptable_scores: args.quality_cutoff.map(acceptable_scores),
+        trim_front: args.trim_front,
+        trim_tail: args.trim_tail,
+        maximum_length: args.truncate_to,
+        minimum_length: args.min_length,
+    };
 
-    if use_stream {
-        let output = match get_output(args.output.as_deref()) {
-            Ok(output) => output,
-            Err(e) => {
-                eprintln!("Error opening output: {}", e);
-                process::exit(1);
-            }
-        };
+    let result = (|| {
+        let rendering = Rendering::for_output(args.output.as_deref());
+        let output = open_output(args.output.as_deref())?;
+        let mut trimmer = Trimmer::new(output, settings, rendering);
+        map_reduce::for_each_record_at_paths(
+            &args.inputs,
+            &mut trimmer,
+            Trimmer::push,
+        )?;
+        trimmer.finish()
+    })();
 
-        if let Err(e) = fastq_trim_stream(
-            FastqStreamParser::new(io::stdin()),
-            output,
-            args.quality_cutoff,
-            args.trim_front,
-            args.trim_tail,
-            args.max_length,
-            args.min_length,
-        ) {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                process::exit(0);
-            }
-            eprintln!("Error processing FASTQ: {}", e);
-            process::exit(1);
-        }
-    } else {
-        let input = match get_input(args.input.as_deref()) {
-            Ok(input) => input,
-            Err(e) => {
-                eprintln!("Error reading input: {}", e);
-                process::exit(1);
-            }
-        };
-
-        let output = match get_output(args.output.as_deref()) {
-            Ok(output) => output,
-            Err(e) => {
-                eprintln!("Error opening output: {}", e);
-                process::exit(1);
-            }
-        };
-
-        if let Err(e) = fastq_trim(
-            input.as_bytes(),
-            output,
-            args.quality_cutoff,
-            args.trim_front,
-            args.trim_tail,
-            args.max_length,
-            args.min_length,
-        ) {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                process::exit(0);
-            }
-            eprintln!("Error processing FASTQ: {}", e);
-            process::exit(1);
-        }
-    }
+    finish_or_exit("Error trimming reads", result);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    
+    fn trim(data: &[u8], settings: TrimSettings) -> String {
+        let mut trimmer = Trimmer::new(Vec::new(), settings, Rendering::PLAIN);
+        map_reduce::for_each_record_in_bytes(
+            data,
+            &mut trimmer,
+            Trimmer::push).unwrap();
+        String::from_utf8(trimmer.writer.into_inner()).unwrap()
+    }
 
+    fn trim_fasta(data: &[u8], settings: TrimSettings) -> io::Result<String> {
+        let mut trimmer = Trimmer::new(Vec::new(), settings, Rendering::PLAIN);
+        map_reduce::for_each_record_in_bytes(
+            data,
+            &mut trimmer,
+            Trimmer::push,
+        )?;
+        Ok(String::from_utf8(trimmer.writer.into_inner()).unwrap())
+    }
+
+    /// A FASTA record carries no quality, so a quality cutoff has nothing to act on.
+    /// Bounding the walk by the sequence length instead indexed an empty slice and aborted.
     #[test]
-    fn trim_front() {
-        let data = b"@seq1\nACGTACGT\n+\nIIIIIIII\n";
-        let mut output = Vec::new();
-        fastq_trim(&data[..], &mut output, None, 2, 0, None, None).unwrap();
+    fn quality_cutoff_on_fasta_is_rejected_not_a_panic() {
+        let settings = TrimSettings {
+            acceptable_scores: Some(acceptable_scores(20)),
+            ..Default::default()
+        };
+        let error = trim_fasta(b">seq1\nACGTACGT\n", settings).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("FASTQ"), "{error}");
+    }
 
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains("GTACGT"));
+    /// Position trimming needs no quality, so it must still work on FASTA.
+    #[test]
+    fn position_trimming_works_on_fasta() {
+        let settings = TrimSettings {
+            trim_front: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            trim_fasta(b">seq1\nAACGTT\n", settings).unwrap(),
+            ">seq1\nCGTT\n"
+        );
     }
 
     #[test]
-    fn trim_tail() {
-        let data = b"@seq1\nACGTACGT\n+\nIIIIIIII\n";
-        let mut output = Vec::new();
-        fastq_trim(&data[..], &mut output, None, 0, 2, None, None).unwrap();
+    fn trims_fixed_offsets() {
+        let data = b"@seq1\nAACGTT\n+\nIIIIII\n";
+        let front = TrimSettings {
+            trim_front: 2,
+            ..Default::default()
+        };
+        assert_eq!(trim(data, front), "@seq1\nCGTT\n+\nIIII\n");
 
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains("ACGTAC"));
+        let tail = TrimSettings {
+            trim_tail: 2,
+            ..Default::default()
+        };
+        assert_eq!(trim(data, tail), "@seq1\nAACG\n+\nIIII\n");
+    }
+
+    /// Quality trimming walks in from both ends. '#' is Q2, 'I' is Q40.
+    #[test]
+    fn trims_low_quality_ends() {
+        let data = b"@seq1\nAACGTT\n+\n##IIII\n";
+        let settings = TrimSettings {
+            acceptable_scores: Some(acceptable_scores(20)),
+            ..Default::default()
+        };
+        assert_eq!(trim(data, settings), "@seq1\nCGTT\n+\nIIII\n");
+
+        let both = b"@seq1\nAACGTT\n+\n#IIII#\n";
+        assert_eq!(trim(both, settings), "@seq1\nACGT\n+\nIIII\n");
+    }
+
+    /// Every base below the cutoff leaves the scan with nothing to find.
+    #[test]
+    fn a_read_entirely_below_the_cutoff_is_emptied() {
+        let settings = TrimSettings {
+            acceptable_scores: Some(acceptable_scores(40)),
+            ..Default::default()
+        };
+        assert_eq!(trim(b"@seq1\nACGT\n+\n####\n", settings), "@seq1\n\n+\n\n");
     }
 
     #[test]
-    fn min_length_filter() {
+    fn drops_reads_below_minimum_length() {
+        let data = b"@keep\nACGTACGT\n+\nIIIIIIII\n@drop\nACGT\n+\nIIII\n";
+        let settings = TrimSettings {
+            minimum_length: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(trim(data, settings), "@keep\nACGTACGT\n+\nIIIIIIII\n");
+    }
+
+    #[test]
+    fn caps_at_maximum_length() {
+        let data = b"@seq1\nACGTACGT\n+\nIIIIIIII\n";
+        let settings = TrimSettings {
+            maximum_length: Some(4),
+            ..Default::default()
+        };
+        assert_eq!(trim(data, settings), "@seq1\nACGT\n+\nIIII\n");
+    }
+
+    /// Trimming more than the read holds must yield an empty read, not underflow.
+    #[test]
+    fn over_trimming_yields_an_empty_read() {
         let data = b"@seq1\nACGT\n+\nIIII\n";
-        let mut output = Vec::new();
-        fastq_trim(&data[..], &mut output, None, 2, 0, None, Some(10)).unwrap();
+        let settings = TrimSettings {
+            trim_front: 3,
+            trim_tail: 3,
+            ..Default::default()
+        };
+        assert_eq!(trim(data, settings), "@seq1\n\n+\n\n");
+    }
 
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.is_empty()); // Read filtered out
+    /// Quality and sequence must stay the same length after every combination.
+    #[test]
+    fn sequence_and_quality_stay_aligned() {
+        let data = b"@seq1\nAACGTTAA\n+\n##IIII##\n";
+        let settings = TrimSettings {
+            acceptable_scores: Some(acceptable_scores(20)),
+            trim_front: 1,
+            trim_tail: 1,
+            maximum_length: Some(2),
+            ..Default::default()
+        };
+        let output = trim(data, settings);
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines[1].len(), lines[3].len(), "{output}");
+    }
+
+    #[test]
+    fn counts_are_tracked() {
+        let data = b"@keep\nACGTACGT\n+\nIIIIIIII\n@drop\nACGT\n+\nIIII\n";
+        let settings = TrimSettings {
+            minimum_length: Some(5),
+            ..Default::default()
+        };
+        let mut trimmer = Trimmer::new(Vec::new(), settings, Rendering::PLAIN);
+        map_reduce::for_each_record_in_bytes(
+            data,
+            &mut trimmer,
+            Trimmer::push).unwrap();
+        assert_eq!(trimmer.examined, 2);
+        assert_eq!(trimmer.retained, 1);
     }
 }

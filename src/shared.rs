@@ -19,7 +19,7 @@ pub mod map_reduce;
 
 use std::io::{self, Read};
 
-use stringzilla::sz::{find, find_byteset, Byteset};
+use stringzilla::sz::{bytesum, find, find_byteset, hash_with_seed, Byteset};
 
 // region: Records
 
@@ -68,12 +68,30 @@ impl<'a> Record<'a> {
         }
     }
 
-    /// Identifier: the header up to the first space or tab, sigil stripped.
+    /// Format this record was parsed from, taken from its sigil.
+    #[inline]
+    pub fn format(&self) -> SequenceFormat {
+        match self.header.first() {
+            Some(b'@') => SequenceFormat::Fastq,
+            _ => SequenceFormat::Fasta,
+        }
+    }
+
+    /// Identifier: the header up to the first space or tab, sigil stripped, without any
+    /// trailing `/1` or `/2` mate suffix.
+    ///
+    /// Dropping the mate suffix is what makes paired R1 and R2 files agree on a record's
+    /// identity, so a keyed sample selects matching pairs. Modern Illumina headers put the
+    /// mate number after the first blank and are unaffected.
     pub fn identifier(&self) -> &'a [u8] {
         let without_sigil = self.header_without_sigil();
-        match find_byteset(without_sigil, FIELD_SEPARATORS) {
+        let field = match find_byteset(without_sigil, FIELD_SEPARATORS) {
             Some(position) => &without_sigil[..position],
             None => without_sigil,
+        };
+        match field {
+            [head @ .., b'/', b'1' | b'2'] => head,
+            _ => field,
         }
     }
 }
@@ -120,13 +138,17 @@ const FIELD_SEPARATORS: Byteset = Byteset::from_bytes(b" \t");
 /// Everything stripped from a sequence or quality region.
 const WHITESPACE: Byteset = Byteset::from_bytes(b" \t\r\n");
 
-/// Detect the format from the first non-whitespace byte.
-pub fn detect_format(data: &[u8]) -> io::Result<SequenceFormat> {
+/// Format of the first record, or `None` when the input holds no records.
+///
+/// An input with nothing in it is empty, not malformed, so a filter that rejects every
+/// record still composes into the next tool in a pipeline. Only a first byte that opens
+/// neither format is an error.
+pub fn detect_format(data: &[u8]) -> io::Result<Option<SequenceFormat>> {
     for &byte in data.iter() {
         match byte {
             b' ' | b'\t' | b'\r' | b'\n' => continue,
-            b'@' => return Ok(SequenceFormat::Fastq),
-            b'>' => return Ok(SequenceFormat::Fasta),
+            b'@' => return Ok(Some(SequenceFormat::Fastq)),
+            b'>' => return Ok(Some(SequenceFormat::Fasta)),
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -135,10 +157,7 @@ pub fn detect_format(data: &[u8]) -> io::Result<SequenceFormat> {
             }
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "empty or whitespace-only input",
-    ))
+    Ok(None)
 }
 
 /// ASCII quality character to Phred score, Phred+33 as used by Illumina 1.8 and later.
@@ -155,11 +174,39 @@ pub fn phred33_to_ascii(phred: u8) -> u8 {
 
 /// Mean Phred score across a quality string.
 pub fn mean_quality(quality: &[u8]) -> f32 {
-    if quality.is_empty() {
-        return 0.0;
-    }
-    let total: u32 = quality.iter().map(|&byte| ascii_to_phred33(byte) as u32).sum();
-    total as f32 / quality.len() as f32
+    phred33_sum(quality) as f32 / quality.len().max(1) as f32
+}
+
+/// Sum of Phred scores across a quality string.
+///
+/// Every score is its byte less 33, so one byte sum gives the total exactly.
+pub fn phred33_sum(quality: &[u8]) -> u64 {
+    bytesum(quality).saturating_sub(33 * quality.len() as u64)
+}
+
+/// Which part of a record its identity is taken from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordKey {
+    /// Header up to the first blank, with any paired-end mate suffix removed.
+    Identifier,
+    /// Whole header line, excluding the sigil.
+    Header,
+    /// Sequence bytes, whitespace already removed.
+    Sequence,
+}
+
+/// Seeded 64-bit digest of one record field.
+///
+/// Pure, so the same record yields the same digest whatever its position in the input, how
+/// the inputs were ordered, or how many workers ran. That is what lets sampling and
+/// deduplication shard without changing their answers.
+pub fn digest(record: &Record<'_>, key: RecordKey, seed: u64) -> u64 {
+    let bytes = match key {
+        RecordKey::Identifier => record.identifier(),
+        RecordKey::Header => record.header_without_sigil(),
+        RecordKey::Sequence => record.sequence,
+    };
+    hash_with_seed(bytes, seed)
 }
 
 // endregion: Records
@@ -199,14 +246,13 @@ fn find_line_end(buffer: &[u8], from: usize) -> Option<usize> {
     find(&buffer[from..], b"\n").map(|offset| from + offset)
 }
 
-/// First byte that is not a line terminator or blank.
+/// Anything that is not whitespace, so a scan can find where content starts.
+const CONTENT: Byteset = WHITESPACE.inverted();
+
+/// Offset of the first byte that is not a line terminator or blank.
 #[inline]
 fn skip_leading_whitespace(buffer: &[u8]) -> usize {
-    let mut cursor = 0;
-    while cursor < buffer.len() && matches!(buffer[cursor], b' ' | b'\t' | b'\r' | b'\n') {
-        cursor += 1;
-    }
-    cursor
+    find_byteset(buffer, CONTENT).unwrap_or(buffer.len())
 }
 
 /// Line length excluding a trailing carriage return, so CRLF files count correctly.
@@ -533,8 +579,8 @@ impl<'a> RandomAccess<'a> {
         self.data
     }
 
-    /// Format of the first record, from the leading non-whitespace byte.
-    pub fn detect_format(&self) -> io::Result<SequenceFormat> {
+    /// Format of the first record, or `None` when there are no records.
+    pub fn detect_format(&self) -> io::Result<Option<SequenceFormat>> {
         detect_format(self.data)
     }
 
@@ -545,11 +591,14 @@ impl<'a> RandomAccess<'a> {
     pub fn for_each_record_in(
         &self,
         range: core::ops::Range<usize>,
-        format: SequenceFormat,
         mut visit: impl FnMut(Record<'_>) -> io::Result<()>,
     ) -> io::Result<()> {
         let mut scratch = RecordScratch::new();
         let region = &self.data[range];
+        // A region with no records is empty, not malformed, so there is nothing to visit.
+        let Some(format) = detect_format(region)? else {
+            return Ok(());
+        };
         let mut consumed = 0usize;
 
         while consumed < region.len() {
@@ -570,10 +619,9 @@ impl<'a> RandomAccess<'a> {
     /// Visit every record in the whole input.
     pub fn for_each_record(
         &self,
-        format: SequenceFormat,
         visit: impl FnMut(Record<'_>) -> io::Result<()>,
     ) -> io::Result<()> {
-        self.for_each_record_in(0..self.data.len(), format, visit)
+        self.for_each_record_in(0..self.data.len(), visit)
     }
 }
 
@@ -598,13 +646,32 @@ impl<R: Read> ForwardAccess<R> {
     /// and it is reset in the same block, so no stale offset can survive a compaction.
     pub fn for_each_record(
         &mut self,
-        format: SequenceFormat,
         mut visit: impl FnMut(Record<'_>) -> io::Result<()>,
     ) -> io::Result<()> {
         let mut scratch = RecordScratch::new();
         let mut filled = 0usize;
         let mut consumed = 0usize;
         let mut at_eof = false;
+
+        // The parser needs a format, so the first window supplies it. A stream with no
+        // records is empty, not malformed.
+        let format = loop {
+            match detect_format(&self.window[..filled])? {
+                Some(format) => break format,
+                None if at_eof => return Ok(()),
+                None => {
+                    if filled == self.window.len() {
+                        self.window.resize(self.window.len() * 2, 0);
+                    }
+                    let read_bytes = self.reader.read(&mut self.window[filled..])?;
+                    if read_bytes == 0 {
+                        at_eof = true;
+                    } else {
+                        filled += read_bytes;
+                    }
+                }
+            }
+        };
 
         /// What the parse decided, carrying no borrow of the window.
         enum Outcome {
@@ -661,23 +728,10 @@ impl<R: Read> ForwardAccess<R> {
     }
 }
 
-/// Bytes sniffed from a stream to decide its format before parsing starts.
-const PEEK_BYTES: usize = 8 << 10;
-
 impl ForwardAccess<Box<dyn Read>> {
-    /// Read a prefix of standard input, detect the format, and replay it into the stream.
-        pub fn from_stdin() -> io::Result<(SequenceFormat, Self)> {
-        let mut prefix = Vec::with_capacity(PEEK_BYTES);
-        io::stdin()
-            .lock()
-            .by_ref()
-            .take(PEEK_BYTES as u64)
-            .read_to_end(&mut prefix)?;
-        let format = detect_format(&prefix)?;
-        // `Chain` stops at the end of its first source, so this short-reads exactly once.
-        // Harmless: the window treats a short read like any other.
-        let reader: Box<dyn Read> = Box::new(io::Cursor::new(prefix).chain(io::stdin()));
-        Ok((format, ForwardAccess::new(reader)))
+    /// A stream over standard input.
+    pub fn from_stdin() -> Self {
+        ForwardAccess::new(Box::new(io::stdin()))
     }
 }
 
@@ -691,23 +745,142 @@ pub fn map_file(path: &str) -> io::Result<memmap2::Mmap> {
 
 // region: Output
 
+/// How records are rendered, decided by whether the destination is a terminal.
+///
+/// A human reading a chromosome wants it wrapped and coloured; a file or pipe wants neither,
+/// so redirecting and piping produce identical bytes and nothing downstream meets an escape
+/// sequence. This is the convention `ls` follows, and the reason the default is detected
+/// rather than flagged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rendering {
+    /// Columns per sequence line; `0` writes each sequence on one line.
+    pub line_width: usize,
+    /// Colour nucleotides by base.
+    pub color: bool,
+}
+
+impl Rendering {
+    /// Plain: one line per sequence, no colour. What a file or pipe receives.
+    pub const PLAIN: Self = Self {
+        line_width: 0,
+        color: false,
+    };
+
+    /// Wrapped at 60 columns and coloured. What a terminal receives.
+    pub const TERMINAL: Self = Self {
+        line_width: 60,
+        color: true,
+    };
+
+    /// [`Rendering::TERMINAL`] when `path` names standard output and that is a terminal,
+    /// [`Rendering::PLAIN`] otherwise.
+    pub fn for_output(path: Option<&str>) -> Self {
+        let to_stdout = matches!(path, None | Some("-"));
+        if to_stdout && std::io::IsTerminal::is_terminal(&io::stdout()) {
+            Self::TERMINAL
+        } else {
+            Self::PLAIN
+        }
+    }
+}
+
+/// Foreground colour for one nucleotide, or `None` to leave it uncoloured.
+fn base_color(base: u8) -> Option<&'static [u8]> {
+    match base.to_ascii_uppercase() {
+        b'A' => Some(b"\x1b[32m"),
+        b'C' => Some(b"\x1b[34m"),
+        b'G' => Some(b"\x1b[33m"),
+        b'T' | b'U' => Some(b"\x1b[31m"),
+        b'N' => Some(b"\x1b[90m"),
+        _ => None,
+    }
+}
+
+/// Append `sequence`, wrapped per `rendering`, followed by a line terminator.
+///
+/// Split by case so the plain form — what every file and pipe receives — is one copy per
+/// line rather than a decision per byte.
+fn sequence_into(target: &mut Vec<u8>, sequence: &[u8], rendering: Rendering) {
+    match (rendering.line_width, rendering.color) {
+        (0, false) => target.extend_from_slice(sequence),
+        (width, false) => {
+            for line in sequence.chunks(width) {
+                target.extend_from_slice(line);
+                target.push(b'\n');
+            }
+            return;
+        }
+        (width, true) => {
+            colored_sequence_into(target, sequence, width);
+            return;
+        }
+    }
+    target.push(b'\n');
+}
+
+/// Append `sequence` wrapped at `width` and coloured by base.
+///
+/// Reached only when the destination is a terminal, so its cost never falls on a pipe.
+/// Colour is emitted per run rather than per byte, so a homopolymer costs one escape.
+fn colored_sequence_into(target: &mut Vec<u8>, sequence: &[u8], width: usize) {
+    const RESET: &[u8] = b"\x1b[0m";
+    let width = if width == 0 { usize::MAX } else { width };
+
+    for line in sequence.chunks(width) {
+        let mut active: Option<&'static [u8]> = None;
+        for &base in line {
+            let wanted = base_color(base);
+            if wanted != active {
+                if active.is_some() {
+                    target.extend_from_slice(RESET);
+                }
+                if let Some(escape) = wanted {
+                    target.extend_from_slice(escape);
+                }
+                active = wanted;
+            }
+            target.push(base);
+        }
+        if active.is_some() {
+            target.extend_from_slice(RESET);
+        }
+        target.push(b'\n');
+    }
+}
+
 /// Append one formatted record to `target`. Quality is emitted only for FASTQ output.
 fn format_into(
     target: &mut Vec<u8>,
     format: SequenceFormat,
+    rendering: Rendering,
     header_body: &[u8],
     sequence: &[u8],
     quality: &[u8],
 ) {
+    if rendering.color {
+        target.extend_from_slice(b"\x1b[1;36m");
+    }
     target.push(format.sigil());
     target.extend_from_slice(header_body);
+    if rendering.color {
+        target.extend_from_slice(b"\x1b[0m");
+    }
     target.push(b'\n');
-    target.extend_from_slice(sequence);
-    target.push(b'\n');
+
+    sequence_into(target, sequence, rendering);
+
     if format == SequenceFormat::Fastq {
         target.extend_from_slice(b"+\n");
-        target.extend_from_slice(quality);
-        target.push(b'\n');
+        // Quality wraps with the sequence so the two stay line-aligned, and is never
+        // coloured, since its bytes are scores rather than bases.
+        sequence_into(
+            target,
+            quality,
+            Rendering {
+                color: false,
+                ..rendering
+            },
+        );
     }
 }
 
@@ -717,15 +890,28 @@ pub struct RecordWriter<W: io::Write> {
     writer: W,
     staging: Vec<u8>,
     format: SequenceFormat,
+    /// Format settled by [`RecordWriter::adopt`], so a later disagreement is caught.
+    adopted: Option<SequenceFormat>,
+    rendering: Rendering,
 }
 
 impl<W: io::Write> RecordWriter<W> {
-    /// Wraps a writer, emitting records in `format` until [`RecordWriter::set_format`] says otherwise.
+    /// Wraps a writer, emitting plain records in `format` until told otherwise.
     pub fn new(writer: W, format: SequenceFormat) -> Self {
         Self {
             writer,
             staging: Vec::with_capacity(4 << 10),
             format,
+            adopted: None,
+            rendering: Rendering::PLAIN,
+        }
+    }
+
+    /// Wraps a writer that renders per `rendering`.
+    pub fn with_rendering(writer: W, rendering: Rendering, format: SequenceFormat) -> Self {
+        Self {
+            rendering,
+            ..Self::new(writer, format)
         }
     }
 
@@ -734,10 +920,29 @@ impl<W: io::Write> RecordWriter<W> {
         self.format
     }
 
-    /// Choose the output format after construction, which is how a mirroring tool
-    /// applies the format handed to it before records start arriving.
+    /// Choose the output format after construction.
     pub fn set_format(&mut self, format: SequenceFormat) {
         self.format = format;
+    }
+
+    /// Mirror `format` onto the output, settling on the first record's and refusing a later
+    /// change, since one stream cannot carry both.
+    ///
+    /// Idempotent, so a tool can call it per record instead of needing a hook that fires
+    /// before the records do.
+    pub fn adopt(&mut self, format: SequenceFormat) -> io::Result<()> {
+        match self.adopted {
+            Some(first) if first != format => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("input is {format:?} but an earlier record was {first:?}; one output stream cannot carry both"),
+            )),
+            Some(_) => Ok(()),
+            None => {
+                self.adopted = Some(format);
+                self.format = format;
+                Ok(())
+            }
+        }
     }
 
     /// Write `record` verbatim, re-sigiling the header to the output format.
@@ -759,6 +964,7 @@ impl<W: io::Write> RecordWriter<W> {
         format_into(
             &mut self.staging,
             self.format,
+            self.rendering,
             header_body,
             sequence,
             quality,
@@ -775,13 +981,14 @@ impl<W: io::Write> RecordWriter<W> {
         format_into(
             target,
             self.format,
+            self.rendering,
             record.header_without_sigil(),
             record.sequence,
             record.quality,
         );
     }
 
-    /// Write bytes produced by [`RecordWriter::render`], which are already formatted.
+    /// Write bytes produced by [`RecordWriter::render_into`], which are already formatted.
     pub fn write_rendered(&mut self, rendered: &[u8]) -> io::Result<()> {
         self.writer.write_all(rendered)
     }
@@ -826,10 +1033,13 @@ mod tests {
 
     #[test]
     fn detects_both_formats() {
-        assert_eq!(detect_format(b">seq1\nACGT\n").unwrap(), SequenceFormat::Fasta);
+        assert_eq!(
+            detect_format(b">seq1\nACGT\n").unwrap(),
+            Some(SequenceFormat::Fasta)
+        );
         assert_eq!(
             detect_format(b"@seq1\nACGT\n+\nIIII\n").unwrap(),
-            SequenceFormat::Fastq
+            Some(SequenceFormat::Fastq)
         );
     }
 
@@ -837,20 +1047,24 @@ mod tests {
     fn detects_past_leading_whitespace() {
         assert_eq!(
             detect_format(b"  \n  >seq1\nACGT\n").unwrap(),
-            SequenceFormat::Fasta
+            Some(SequenceFormat::Fasta)
         );
     }
 
     #[test]
-    fn rejects_unknown_and_empty() {
+    fn rejects_an_unknown_first_byte() {
         assert_eq!(
             detect_format(b"ACGT\n").unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
-        assert_eq!(
-            detect_format(b"   \n").unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
+    }
+
+    /// An input holding no records is empty, not malformed, so a filter that rejects
+    /// everything still composes into the next tool in a pipeline.
+    #[test]
+    fn empty_input_has_no_format_and_is_not_an_error() {
+        assert_eq!(detect_format(b"").unwrap(), None);
+        assert_eq!(detect_format(b"   \n").unwrap(), None);
     }
 
     #[test]
@@ -1143,7 +1357,7 @@ mod tests {
 
     fn drive_bytes(data: &[u8], format: SequenceFormat) -> io::Result<Collector> {
         let mut sink = Collector::default();
-        RandomAccess::new(data).for_each_record(format, |record| sink.push(record))?;
+        RandomAccess::new(data).for_each_record(|record| sink.push(record))?;
         sink.finish()?;
         Ok(sink)
     }
@@ -1160,7 +1374,7 @@ mod tests {
             limit,
         };
         ForwardAccess::with_window(reader, window)
-            .for_each_record(format, |record| sink.push(record))?;
+            .for_each_record(|record| sink.push(record))?;
         sink.finish()?;
         Ok(sink)
     }
@@ -1244,7 +1458,7 @@ mod tests {
     fn finish_runs_even_with_no_records() {
         let mut sink = Collector::default();
         RandomAccess::new(b"")
-            .for_each_record(SequenceFormat::Fasta, |record| sink.push(record))
+            .for_each_record(|record| sink.push(record))
             .unwrap();
         sink.finish().unwrap();
         assert!(sink.finished);
@@ -1253,7 +1467,7 @@ mod tests {
     #[test]
     fn format_detection_feeds_the_driver() {
         let data = sample_fasta(3);
-        let format = detect_format(&data).unwrap();
+        let format = detect_format(&data).unwrap().unwrap();
         assert_eq!(format, SequenceFormat::Fasta);
         assert_eq!(drive_bytes(&data, format).unwrap().records, 3);
     }

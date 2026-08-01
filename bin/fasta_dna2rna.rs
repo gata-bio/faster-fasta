@@ -1,98 +1,81 @@
-//! DNA to RNA conversion utility for FASTA and FASTQ files
+//! DNA to RNA transcription.
 //!
-//! Convert DNA sequences to RNA (T→U).
-//! Uses StringZilla's `lookup()` for SIMD-accelerated character mapping.
-//! Auto-detects format and preserves it (FASTQ quality scores are preserved).
+//! Rewrites thymine as uracil through a 256-byte lookup table, preserving case. Headers
+//! and quality strings pass through untouched, since transcription changes neither.
 //!
-//! **Memory**: O(1) - processes one sequence at a time
-//! **Streaming**: Yes - constant memory usage
+//! __Memory__: O(longest record) — one scratch buffer reused across every record.
+//! __Streaming__: yes, for files and pipes alike.
 //!
 //! # Examples
 //!
 //! ```bash
-//! # Convert FASTA
-//! fasta-dna2rna sequences.fasta -o rna.fasta
-//!
-//! # Convert FASTQ (quality preserved)
-//! fasta-dna2rna reads.fastq -o rna.fastq
-//!
-//! # From stdin
-//! cat dna.fasta | fasta-dna2rna > rna.fasta
+//! fasta-dna2rna sequences.fasta -o transcribed.fasta
+//! cat reads.fastq | fasta-dna2rna > transcribed.fastq
 //! ```
 
 use std::io::{self, Write};
-use std::process;
 
 use clap::Parser;
 use stringzilla::sz::lookup;
 
-use faster_fasta::shared::*;
+use faster_fasta::{finish_or_exit, map_reduce, open_output, Record, Rendering, RecordWriter, SequenceFormat};
 
-/// Convert DNA sequences to RNA (FASTA or FASTQ)
-///
-/// Converts T (thymine) to U (uracil) using StringZilla's lookup() function.
-/// Handles both uppercase and lowercase bases.
-/// Auto-detects format and preserves it (FASTQ quality scores are preserved).
-pub fn fasta_dna2rna(input: &[u8], mut output: impl Write) -> io::Result<()> {
-    let format = detect_format(input)?;
-
-    // StringZilla translation table for DNA -> RNA
+/// Thymine to uracil in both cases; every other byte maps to itself.
+fn transcription_table() -> [u8; 256] {
     let mut table = [0u8; 256];
-    for i in 0..256 {
-        table[i] = i as u8;
+    for (index, entry) in table.iter_mut().enumerate() {
+        *entry = index as u8;
     }
-    // Convert T to U
     table[b'T' as usize] = b'U';
     table[b't' as usize] = b'u';
+    table
+}
 
-    match format {
-        SeqFormat::Fasta => {
-            let parser = FastaParser::new(input);
-            for entry in parser {
-                let seq = entry.sequence.as_bytes();
-                let mut rna = vec![0u8; seq.len()];
-                lookup(&mut rna, seq, table);
+struct Transcriber<W: Write> {
+    writer: RecordWriter<W>,
+    table: [u8; 256],
+    scratch: Vec<u8>,
+}
 
-                output.write_all(entry.header)?;
-                output.write_all(b"\n")?;
-                output.write_all(&rna)?;
-                output.write_all(b"\n")?;
-            }
-        }
-        SeqFormat::Fastq => {
-            let parser = FastqParser::new(input);
-            for entry in parser {
-                let entry = entry?;
-                let seq = entry.sequence.as_bytes();
-                let mut rna = vec![0u8; seq.len()];
-                lookup(&mut rna, seq, table);
-
-                output.write_all(entry.header)?;
-                output.write_all(b"\n")?;
-                output.write_all(&rna)?;
-                output.write_all(b"\n+\n")?;
-                output.write_all(entry.quality)?;
-                output.write_all(b"\n")?;
-            }
+impl<W: Write> Transcriber<W> {
+    fn new(writer: W, format: SequenceFormat, rendering: Rendering) -> Self {
+        Self {
+            writer: RecordWriter::with_rendering(writer, rendering, format),
+            table: transcription_table(),
+            scratch: Vec::new(),
         }
     }
 
-    output.flush()?;
-    Ok(())
+    fn push(&mut self, record: Record<'_>) -> io::Result<()> {
+        self.writer.adopt(record.format())?;
+        let length = record.sequence.len();
+        if self.scratch.len() < length {
+            self.scratch.resize(length, 0);
+        }
+        lookup(&mut self.scratch[..length], record.sequence, self.table);
+
+        self.writer
+            .write_parts(record.header_without_sigil(), &self.scratch[..length], record.quality)
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
 }
 
-/// Convert DNA sequences to RNA (T -> U)
+/// Transcribe DNA to RNA
 #[derive(Parser)]
 #[command(name = "fasta-dna2rna")]
-#[command(version, about = "Convert DNA to RNA (T→U)")]
+#[command(version, about = "Transcribe DNA to RNA by rewriting T as U")]
 #[command(
-    long_about = "Convert DNA sequences to RNA from FASTA or FASTQ files.\nAuto-detects format and preserves it (FASTQ quality scores are preserved).\nUses SIMD-accelerated character mapping."
+    long_about = "Transcribe FASTA or FASTQ sequences from DNA to RNA.\nThymine becomes uracil in both cases; headers and quality strings are unchanged.\nSingle pass, works on files and pipes alike."
 )]
 struct Args {
-    /// Input file (FASTA or FASTQ, use '-' or omit for stdin)
-    input: Option<String>,
+    /// Input files, FASTA or FASTQ; '-' or omitted reads standard input
+    #[arg(default_value = "-")]
+    inputs: Vec<String>,
 
-    /// Output file (use '-' or omit for stdout)
+    /// Output file; '-' or omitted writes standard output
     #[arg(short, long)]
     output: Option<String>,
 }
@@ -100,99 +83,77 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    let input = match get_input(args.input.as_deref()) {
-        Ok(input) => input,
-        Err(e) => {
-            eprintln!("Error reading input: {}", e);
-            process::exit(1);
-        }
-    };
+    let result = (|| {
+        let rendering = Rendering::for_output(args.output.as_deref());
+        let output = open_output(args.output.as_deref())?;
+        // The placeholder format is replaced by `begin` before any record arrives.
+        let mut transcriber = Transcriber::new(output, SequenceFormat::Fasta, rendering);
+        map_reduce::for_each_record_at_paths(
+            &args.inputs,
+            &mut transcriber,
+            Transcriber::push,
+        )?;
+        transcriber.finish()
+    })();
 
-    let output = match get_output(args.output.as_deref()) {
-        Ok(output) => output,
-        Err(e) => {
-            eprintln!("Error opening output: {}", e);
-            process::exit(1);
-        }
-    };
-
-    if let Err(e) = fasta_dna2rna(input.as_bytes(), output) {
-        if e.kind() == io::ErrorKind::BrokenPipe {
-            process::exit(0);
-        }
-        eprintln!("Error processing sequences: {}", e);
-        process::exit(1);
-    }
+    finish_or_exit("Error transcribing", result);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn dna2rna_simple() {
-        let data = b">seq1\nACGT\n";
-        let mut output = Vec::new();
-        fasta_dna2rna(data, &mut output).unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains(">seq1"));
-        assert!(result.contains("ACGU"));
+    
+    fn transcribe(data: &[u8], format: SequenceFormat) -> String {
+        let mut transcriber = Transcriber::new(Vec::new(), format, Rendering::PLAIN);
+        map_reduce::for_each_record_in_bytes(data, &mut transcriber, Transcriber::push).unwrap();
+        String::from_utf8(transcriber.writer.into_inner()).unwrap()
     }
 
     #[test]
-    fn dna2rna_no_thymine() {
-        let data = b">seq1\nACGACG\n";
-        let mut output = Vec::new();
-        fasta_dna2rna(data, &mut output).unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains("ACGACG"));
+    fn rewrites_thymine() {
+        assert_eq!(
+            transcribe(b">seq1\nACGT\n", SequenceFormat::Fasta),
+            ">seq1\nACGU\n"
+        );
     }
 
     #[test]
-    fn dna2rna_all_thymine() {
-        let data = b">seq1\nTTTT\n";
-        let mut output = Vec::new();
-        fasta_dna2rna(data, &mut output).unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains("UUUU"));
+    fn leaves_sequences_without_thymine_alone() {
+        assert_eq!(
+            transcribe(b">seq1\nACGACG\n", SequenceFormat::Fasta),
+            ">seq1\nACGACG\n"
+        );
     }
 
     #[test]
-    fn dna2rna_mixed_case() {
-        let data = b">seq1\nAcGt\n";
-        let mut output = Vec::new();
-        fasta_dna2rna(data, &mut output).unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains("AcGu"));
+    fn preserves_case() {
+        assert_eq!(
+            transcribe(b">seq1\nacgtACGT\n", SequenceFormat::Fasta),
+            ">seq1\nacguACGU\n"
+        );
     }
 
     #[test]
-    fn dna2rna_multiple() {
-        let data = b">seq1\nATGC\n>seq2\nTTAA\n";
-        let mut output = Vec::new();
-        fasta_dna2rna(data, &mut output).unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        let lines: Vec<&str> = result.lines().collect();
-        assert_eq!(lines[1], "AUGC");
-        assert_eq!(lines[3], "UUAA");
+    fn handles_multiple_records() {
+        assert_eq!(
+            transcribe(b">a\nTTTT\n>b\nAAAA\n>c\nATAT\n", SequenceFormat::Fasta),
+            ">a\nUUUU\n>b\nAAAA\n>c\nAUAU\n"
+        );
     }
 
     #[test]
-    fn dna2rna_fastq() {
-        let data = b"@seq1\nATGC\n+\nIIII\n@seq2\nTTAA\n+\nHHHH\n";
-        let mut output = Vec::new();
-        fasta_dna2rna(data, &mut output).unwrap();
+    fn preserves_quality_for_fastq() {
+        assert_eq!(
+            transcribe(b"@seq1\nACGT\n+\nIIII\n", SequenceFormat::Fastq),
+            "@seq1\nACGT\n+\nIIII\n".replace("ACGT", "ACGU")
+        );
+    }
 
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains("AUGC"));
-        assert!(result.contains("UUAA"));
-        // Verify quality is preserved
-        assert!(result.contains("IIII"));
-        assert!(result.contains("HHHH"));
+    #[test]
+    fn joins_wrapped_sequences() {
+        assert_eq!(
+            transcribe(b">seq1\nAT\nGT\n", SequenceFormat::Fasta),
+            ">seq1\nAUGU\n"
+        );
     }
 }

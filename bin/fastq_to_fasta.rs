@@ -1,107 +1,84 @@
-//! FASTQ to FASTA conversion utility
+//! FASTQ to FASTA conversion.
 //!
-//! Convert FASTQ files to FASTA format by dropping quality scores.
-//! Optional quality filtering before conversion.
-//! Streaming implementation with O(1) memory usage.
+//! Drops quality scores and rewrites `@` headers as `>`, optionally filtering on mean
+//! quality first — which is the only reason to do this before dropping the scores.
 //!
-//! **Memory**: O(1) - processes one read at a time
-//! **Streaming**: Yes - no materialization required
+//! __Memory__: O(1) — no per-record allocation.
+//! __Streaming__: yes, for files and pipes alike.
 //!
 //! # Examples
 //!
 //! ```bash
-//! # Simple conversion
-//! fastq-to-fasta reads.fastq -o sequences.fasta
-//!
-//! # Convert only high-quality reads
-//! fastq-to-fasta reads.fastq --min-quality 25 -o high_quality.fasta
-//!
-//! # From stdin
-//! cat reads.fastq | fastq-to-fasta > sequences.fasta
+//! fastq-to-fasta reads.fastq -o reads.fasta
+//! fastq-to-fasta reads.fastq -q 30 -o high_quality.fasta
+//! cat reads.fastq | fastq-to-fasta > reads.fasta
 //! ```
 
-use std::io::{self, Read, Write};
-use std::process;
+use std::io::{self, Write};
 
 use clap::Parser;
 
-use faster_fasta::shared::*;
+use faster_fasta::{finish_or_exit, map_reduce, mean_quality, open_output, Record, Rendering, RecordWriter, SequenceFormat};
 
-/// Convert FASTQ to FASTA format
-///
-/// Drops quality scores and converts @ headers to > headers.
-/// Optional quality filtering: only convert reads meeting quality threshold.
-pub fn fastq_to_fasta(
-    input: &[u8],
-    mut output: impl Write,
-    min_quality: Option<f32>,
-) -> io::Result<()> {
-    let parser = FastqParser::new(input);
-
-    for entry in parser {
-        let entry = entry?;
-        // Optional quality filter
-        if let Some(min_q) = min_quality {
-            if quality::mean_quality(entry.quality) < min_q {
-                continue;
-            }
-        }
-
-        // Convert @ to > for FASTA header
-        output.write_all(b">")?;
-        // Skip the '@' character from FASTQ header
-        if entry.header.len() > 1 {
-            output.write_all(&entry.header[1..])?;
-        }
-        output.write_all(b"\n")?;
-        output.write_all(entry.sequence.as_bytes())?;
-        output.write_all(b"\n")?;
-    }
-
-    output.flush()?;
-    Ok(())
+struct FastaConverter<W: Write> {
+    writer: RecordWriter<W>,
+    minimum_quality: Option<f32>,
+    converted: usize,
+    skipped: usize,
 }
 
-fn fastq_to_fasta_stream(
-    mut parser: FastqStreamParser<impl Read>,
-    mut output: impl Write,
-    min_quality: Option<f32>,
-) -> io::Result<()> {
-    while let Some(entry) = parser.next_entry()? {
-        if let Some(min_q) = min_quality {
-            if quality::mean_quality(&entry.quality) < min_q {
-                continue;
+impl<W: Write> FastaConverter<W> {
+    fn new(writer: W, minimum_quality: Option<f32>, rendering: Rendering) -> Self {
+        Self {
+            // The output format alone performs the conversion: the sigil is rewritten
+            // and quality is not emitted.
+            writer: RecordWriter::with_rendering(writer, rendering, SequenceFormat::Fasta),
+            minimum_quality,
+            converted: 0,
+            skipped: 0,
+        }
+    }
+
+    fn push(&mut self, record: Record<'_>) -> io::Result<()> {
+        if record.format() == SequenceFormat::Fasta && self.minimum_quality.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--min-quality needs FASTQ input, but this input is FASTA",
+            ));
+        }
+        if let Some(threshold) = self.minimum_quality {
+            if mean_quality(record.quality) < threshold {
+                self.skipped += 1;
+                return Ok(());
             }
         }
-
-        output.write_all(b">")?;
-        if entry.header.len() > 1 {
-            output.write_all(&entry.header[1..])?;
-        }
-        output.write_all(b"\n")?;
-        output.write_all(&entry.sequence)?;
-        output.write_all(b"\n")?;
+        self.writer.write_record(record)?;
+        self.converted += 1;
+        Ok(())
     }
-    output.flush()?;
-    Ok(())
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
 }
 
-/// Convert FASTQ to FASTA format
+/// Convert FASTQ to FASTA
 #[derive(Parser)]
 #[command(name = "fastq-to-fasta")]
 #[command(version, about = "Convert FASTQ to FASTA format")]
 #[command(
-    long_about = "Convert FASTQ files to FASTA format by dropping quality scores.\nOptional quality filtering before conversion.\nStreaming implementation with minimal memory usage."
+    long_about = "Convert FASTQ input to FASTA by dropping quality scores.\nOptionally filters on mean quality before the scores are discarded.\nSingle pass, constant memory, works on files and pipes alike."
 )]
 struct Args {
-    /// Input FASTQ file (use '-' or omit for stdin)
-    input: Option<String>,
+    /// Input FASTQ files; '-' or omitted reads standard input
+    #[arg(default_value = "-")]
+    inputs: Vec<String>,
 
-    /// Output FASTA file (use '-' or omit for stdout)
+    /// Output FASTA file; '-' or omitted writes standard output
     #[arg(short, long)]
     output: Option<String>,
 
-    /// Only convert reads with mean quality >= threshold
+    /// Keep only records whose mean quality is at least this Phred score
     #[arg(short = 'q', long)]
     min_quality: Option<f32>,
 }
@@ -109,97 +86,83 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    let use_stream = matches!(args.input.as_deref(), None | Some("-"));
+    let result = (|| {
+        let rendering = Rendering::for_output(args.output.as_deref());
+        let output = open_output(args.output.as_deref())?;
+        let mut converter = FastaConverter::new(output, args.min_quality, rendering);
+        map_reduce::for_each_record_at_paths(
+            &args.inputs,
+            &mut converter,
+            FastaConverter::push,
+        )?;
+        converter.finish()
+    })();
 
-    if use_stream {
-        let output = match get_output(args.output.as_deref()) {
-            Ok(output) => output,
-            Err(e) => {
-                eprintln!("Error opening output: {}", e);
-                process::exit(1);
-            }
-        };
-
-        if let Err(e) = fastq_to_fasta_stream(
-            FastqStreamParser::new(io::stdin()),
-            output,
-            args.min_quality,
-        ) {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                process::exit(0);
-            }
-            eprintln!("Error processing FASTQ: {}", e);
-            process::exit(1);
-        }
-    } else {
-        let input = match get_input(args.input.as_deref()) {
-            Ok(input) => input,
-            Err(e) => {
-                eprintln!("Error reading input: {}", e);
-                process::exit(1);
-            }
-        };
-
-        let output = match get_output(args.output.as_deref()) {
-            Ok(output) => output,
-            Err(e) => {
-                eprintln!("Error opening output: {}", e);
-                process::exit(1);
-            }
-        };
-
-        if let Err(e) = fastq_to_fasta(input.as_bytes(), output, args.min_quality) {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                process::exit(0);
-            }
-            eprintln!("Error processing FASTQ: {}", e);
-            process::exit(1);
-        }
-    }
+    finish_or_exit("Error converting FASTQ", result);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A FASTA record has no quality, so a mean-quality threshold would silently reject
+    /// every record and exit successfully. It is an error instead.
     #[test]
-    fn basic_conversion() {
+    fn quality_threshold_on_fasta_is_rejected() {
+        let mut tool = FastaConverter::new(Vec::new(), Some(30.0), Rendering::PLAIN);
+        let error = map_reduce::for_each_record_in_bytes(b">a\nACGT\n>b\nTTTT\n", &mut tool, FastaConverter::push)
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("--min-quality"), "{error}");
+    }
+    
+    fn convert(data: &[u8], minimum_quality: Option<f32>) -> String {
+        let mut converter = FastaConverter::new(Vec::new(), minimum_quality, Rendering::PLAIN);
+        map_reduce::for_each_record_in_bytes(
+            data,
+            &mut converter,
+            FastaConverter::push).unwrap();
+        String::from_utf8(converter.writer.into_inner()).unwrap()
+    }
+
+    #[test]
+    fn converts_headers_and_drops_quality() {
         let data = b"@seq1 description\nACGT\n+\nIIII\n@seq2\nTGCA\n+\nHHHH\n";
-        let mut output = Vec::new();
-        fastq_to_fasta(data, &mut output, None).unwrap();
-
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains(">seq1 description"));
-        assert!(result.contains(">seq2"));
-        assert!(result.contains("ACGT"));
-        assert!(result.contains("TGCA"));
-        // Ensure no FASTQ artifacts
-        assert!(!result.contains("@"));
-        assert!(!result.contains("+"));
-        assert!(!result.contains("IIII"));
+        assert_eq!(
+            convert(data, None),
+            ">seq1 description\nACGT\n>seq2\nTGCA\n"
+        );
     }
 
     #[test]
-    fn with_quality_filter() {
-        // IIII = Q40, !!!! = Q0
-        let data = b"@seq1\nACGT\n+\nIIII\n@seq2\nTGCA\n+\n!!!!\n";
-        let mut output = Vec::new();
-        fastq_to_fasta(data, &mut output, Some(20.0)).unwrap();
+    fn filters_on_mean_quality() {
+        // 'I' is Q40, '#' is Q2.
+        let data = b"@high\nACGT\n+\nIIII\n@low\nTGCA\n+\n####\n";
+        assert_eq!(convert(data, Some(30.0)), ">high\nACGT\n");
+    }
 
-        let result = String::from_utf8(output).unwrap();
-        assert!(result.contains(">seq1"));
-        assert!(result.contains("ACGT"));
-        assert!(!result.contains(">seq2")); // Filtered out
-        assert!(!result.contains("TGCA"));
+    /// Multi-line input must be joined before conversion, which the previous
+    /// implementation got wrong for quality and therefore for the filter too.
+    #[test]
+    fn joins_wrapped_records() {
+        let data = b"@seq1\nACGT\nTGCA\n+\nIIII\nHHHH\n";
+        assert_eq!(convert(data, None), ">seq1\nACGTTGCA\n");
     }
 
     #[test]
-    fn empty_input() {
-        let data = b"";
-        let mut output = Vec::new();
-        fastq_to_fasta(data, &mut output, None).unwrap();
+    fn empty_input_produces_nothing() {
+        assert_eq!(convert(b"", None), "");
+    }
 
-        let result = String::from_utf8(output).unwrap();
-        assert_eq!(result, "");
+    #[test]
+    fn counts_are_tracked() {
+        let data = b"@high\nACGT\n+\nIIII\n@low\nTGCA\n+\n####\n";
+        let mut converter = FastaConverter::new(Vec::new(), Some(30.0), Rendering::PLAIN);
+        map_reduce::for_each_record_in_bytes(
+            data,
+            &mut converter,
+            FastaConverter::push).unwrap();
+        assert_eq!(converter.converted, 1);
+        assert_eq!(converter.skipped, 1);
     }
 }

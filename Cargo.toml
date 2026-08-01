@@ -37,10 +37,6 @@ name = "fasta-sample"
 path = "bin/fasta_sample.rs"
 
 [[bin]]
-name = "fasta-sort"
-path = "bin/fasta_sort.rs"
-
-[[bin]]
 name = "fasta-revcomp"
 path = "bin/fasta_revcomp.rs"
 
@@ -64,10 +60,3 @@ path = "bin/fastq_stats.rs"
 name = "fastq-to-fasta"
 path = "bin/fastq_to_fasta.rs"
 
-[[bin]]
-name = "fastq-interleave"
-path = "bin/fastq_interleave.rs"
-
-[[bin]]
-name = "fastq-deinterleave"
-path = "bin/fastq_deinterleave.rs"

@@ -509,65 +509,129 @@ pub fn parse_leading_fastq_record<'a>(
     )
 }
 
-/// First record boundary at or after `from`, for a worker handed an arbitrary byte range.
-///
-/// FASTA is unambiguous: a `>` opening a line always starts a record. FASTQ is not, because
-/// `@` is a legal Phred+33 quality byte at Q31, so a candidate is accepted only after a full
-/// four-line cycle checks out — a `+` on the third line and a fourth line matching the
-/// second in length. Records wrapped across several lines cannot be resynchronized this way
-/// and are only safe to read from the start of the file.
-pub fn next_record_boundary(bytes: &[u8], from: usize, format: SequenceFormat) -> Option<usize> {
-    let sigil = format.sigil();
-    // Offset zero earns the same proof as any other candidate. A window handed to one
-    // worker begins mid-record, so its first byte can be a quality '@' at Phred 31 as
-    // easily as a header's, and accepting it unproven would parse the previous worker's
-    // straddling record a second time.
-    if from == 0
-        && bytes.first() == Some(&sigil)
-        && (format == SequenceFormat::Fasta || fastq_cycle_holds(bytes, 0))
-    {
-        return Some(0);
-    }
-
-    // A record opens a line, so the boundary is a newline immediately followed by the sigil.
-    // Searching for both bytes at once leaves the whole scan to one SIMD pass on FASTA,
-    // rather than one pass per line.
-    let needle = [b'\n', sigil];
-    let mut cursor = from;
-    loop {
-        let candidate = find(&bytes[cursor..], needle)? + cursor + 1;
-        if candidate >= bytes.len() {
-            return None;
-        }
-        if format == SequenceFormat::Fasta || fastq_cycle_holds(bytes, candidate) {
-            return Some(candidate);
-        }
-        cursor = candidate;
-    }
+/// Whether a candidate `@` opens a FASTQ record, and when the bytes cannot yet say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CycleProof {
+    /// The four lines have the shape of a record.
+    Holds,
+    /// They do not, whatever follows them.
+    Fails,
+    /// The buffer ended before the fourth line, so the question is still open.
+    Truncated,
 }
 
-/// Whether a candidate `@` really opens a FASTQ record, judged by the shape of the next
-/// four lines rather than by the byte alone.
-fn fastq_cycle_holds(bytes: &[u8], candidate: usize) -> bool {
+/// Whether a candidate `@` really opens a FASTQ record, judged by the shape of the next four
+/// lines rather than by the byte alone.
+///
+/// This is deliberately stricter than [`parse_leading_record`], which may not stand in for it.
+/// A parser assumes it is already at a record and tolerates a sequence wrapped over several
+/// lines, so from a quality line it will swallow the following header as sequence and accept a
+/// later `+`. Resynchronizing needs the opposite bias: exactly four lines, a `+` on the third,
+/// and a fourth matching the second in length.
+fn fastq_cycle(bytes: &[u8], candidate: usize) -> CycleProof {
     let mut cursor = candidate;
     let mut lines = [0usize; 4];
     for slot in lines.iter_mut() {
         let Some(end) = find_line_end(bytes, cursor) else {
-            return false;
+            return CycleProof::Truncated;
         };
         *slot = length_without_carriage_return(&bytes[cursor..end]);
         cursor = end + 1;
     }
     let separator = candidate + lines[0] + 1 + lines[1] + 1;
-    bytes.get(separator) == Some(&b'+') && lines[1] == lines[3]
+    match bytes.get(separator) {
+        None => CycleProof::Truncated,
+        Some(&byte) if byte == b'+' && lines[1] == lines[3] => CycleProof::Holds,
+        Some(_) => CycleProof::Fails,
+    }
+}
+
+/// The proof a candidate needs, for a caller holding all the bytes there will ever be.
+fn cycle_holds(bytes: &[u8], candidate: usize, format: SequenceFormat) -> bool {
+    format == SequenceFormat::Fasta || fastq_cycle(bytes, candidate) == CycleProof::Holds
+}
+
+/// Where a boundary search over a buffer that may still grow has got to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordStart {
+    /// A record begins at this offset.
+    At(usize),
+    /// A candidate here outran the buffer. A caller that can append must search again from
+    /// this offset rather than past it, since one more read may prove it.
+    Undecided(usize),
+    /// No candidate remains in these bytes.
+    NotFound,
+}
+
+/// First record start at or after `from`, for a caller whose buffer may still be filling.
+///
+/// A four-line FASTQ cycle is tens of kilobytes on a long read, so a candidate near the end of
+/// a parse window is undecided rather than rejected. Reporting the two alike is what makes a
+/// streaming caller step past a boundary and drop every record up to the next one.
+pub fn next_record_start(bytes: &[u8], from: usize, format: SequenceFormat) -> RecordStart {
+    let sigil = format.sigil();
+    let mut undecided = None;
+
+    // Offset zero earns the same proof as any other candidate. A window handed to one worker
+    // begins mid-record, so its first byte can be a quality `@` as easily as a header's, and
+    // accepting it unproven would parse the previous worker's straddling record a second time.
+    if from == 0 && bytes.first() == Some(&sigil) {
+        match format {
+            SequenceFormat::Fasta => return RecordStart::At(0),
+            SequenceFormat::Fastq => match fastq_cycle(bytes, 0) {
+                CycleProof::Holds => return RecordStart::At(0),
+                CycleProof::Fails => {}
+                CycleProof::Truncated => undecided = Some(0),
+            },
+        }
+    }
+
+    // A record opens a line, so a boundary is a newline immediately followed by the sigil.
+    // Searching for both bytes at once leaves the whole scan to one SIMD pass.
+    let needle = [b'\n', sigil];
+    let mut cursor = from;
+    loop {
+        let Some(found) = find(&bytes[cursor..], needle) else {
+            break;
+        };
+        let candidate = found + cursor + 1;
+        if candidate >= bytes.len() {
+            undecided = undecided.or(Some(found + cursor));
+            break;
+        }
+        match format {
+            SequenceFormat::Fasta => return RecordStart::At(candidate),
+            SequenceFormat::Fastq => match fastq_cycle(bytes, candidate) {
+                CycleProof::Holds => return RecordStart::At(candidate),
+                CycleProof::Fails => {}
+                CycleProof::Truncated => undecided = undecided.or(Some(candidate - 1)),
+            },
+        }
+        cursor = candidate;
+    }
+
+    match undecided {
+        Some(resume_from) => RecordStart::Undecided(resume_from),
+        None => RecordStart::NotFound,
+    }
+}
+
+/// First record boundary at or after `from`, over bytes that are all the bytes there are.
+///
+/// Records wrapped across several lines cannot be resynchronized this way and are only safe
+/// to read from the start of the input.
+pub fn next_record_boundary(bytes: &[u8], from: usize, format: SequenceFormat) -> Option<usize> {
+    match next_record_start(bytes, from, format) {
+        RecordStart::At(boundary) => Some(boundary),
+        RecordStart::Undecided(_) | RecordStart::NotFound => None,
+    }
 }
 
 /// Last record boundary in `bytes` that can be proven, for a driver that must end a slab
 /// where a record ends.
 ///
-/// Demands the same full four-line proof of a FASTQ candidate as [`next_record_boundary`], so
-/// a boundary whose fourth line the slab cut off is refused and an earlier one reported. The
-/// bytes from the boundary on are a partial record the caller carries into the next slab.
+/// A boundary whose fourth line the slab cut off is refused and an earlier one reported, which
+/// is what the caller wants: those bytes are a partial record it carries into the next slab.
 pub fn last_record_boundary(bytes: &[u8], format: SequenceFormat) -> Option<usize> {
     let sigil = format.sigil();
     let needle = [b'\n', sigil];
@@ -576,9 +640,7 @@ pub fn last_record_boundary(bytes: &[u8], format: SequenceFormat) -> Option<usiz
     let mut searched_back_to = bytes.len();
     while let Some(found) = rfind(&bytes[..searched_back_to], needle) {
         let candidate = found + 1;
-        if candidate < bytes.len()
-            && (format == SequenceFormat::Fasta || fastq_cycle_holds(bytes, candidate))
-        {
+        if candidate < bytes.len() && cycle_holds(bytes, candidate, format) {
             return Some(candidate);
         }
         // The window shrinks past the newline just examined, and a two-byte needle cannot
@@ -588,9 +650,7 @@ pub fn last_record_boundary(bytes: &[u8], format: SequenceFormat) -> Option<usiz
 
     // Offset zero earns the same proof as any other candidate, and is the only boundary a
     // slab holding one record start can offer.
-    (bytes.first() == Some(&sigil)
-        && (format == SequenceFormat::Fasta || fastq_cycle_holds(bytes, 0)))
-    .then_some(0)
+    (bytes.first() == Some(&sigil) && cycle_holds(bytes, 0, format)).then_some(0)
 }
 
 // endregion: Parsing
@@ -873,6 +933,45 @@ mod tests {
         assert_eq!(
             next_record_boundary(data, 1, SequenceFormat::Fasta),
             Some(8)
+        );
+    }
+
+    /// A four-line proof cut short by the end of the buffer is undecided, not rejected.
+    ///
+    /// Long reads make this the common case: a cycle spans tens of kilobytes, so a candidate
+    /// near the end of a parse window cannot be proven yet. Reporting it as rejected made a
+    /// streaming caller resume past it and silently drop every record up to the next one.
+    #[test]
+    fn a_cycle_cut_short_is_undecided_rather_than_rejected() {
+        let first = "@read0\nACGTACGT\n+\nIIIIIIII\n";
+        let whole = format!("{first}@read1\nTGCA\n+\nIIII\n").into_bytes();
+        let whole = whole.as_slice();
+        let boundary = first.len();
+        assert_eq!(
+            next_record_start(whole, 1, SequenceFormat::Fastq),
+            RecordStart::At(boundary)
+        );
+
+        // The same bytes, stopping one short of the fourth line of the second record.
+        let truncated = &whole[..whole.len() - 1];
+        match next_record_start(truncated, 1, SequenceFormat::Fastq) {
+            RecordStart::Undecided(resume_from) => assert!(
+                resume_from <= boundary,
+                "a rescan from {resume_from} would step over the boundary at {boundary}"
+            ),
+            found => panic!("an unprovable candidate must not be reported as {found:?}"),
+        }
+    }
+
+    /// A candidate that really is a quality line stays rejected once the proof can complete.
+    #[test]
+    fn a_complete_proof_still_rejects_a_quality_line() {
+        // The fourth line opens with '@' at Phred 31, which is legal quality and not a header.
+        let before = "@read0\nACGT\n+\n@III\n";
+        let data = format!("{before}@read1\nTGCA\n+\nIIII\n").into_bytes();
+        assert_eq!(
+            next_record_start(&data, 1, SequenceFormat::Fastq),
+            RecordStart::At(before.len())
         );
     }
 

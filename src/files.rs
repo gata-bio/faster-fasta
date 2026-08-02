@@ -16,15 +16,16 @@ use std::io::{self, Read};
 use std::ops::Deref;
 
 use crate::records::{
-    next_record_boundary, parse_leading_record, sequence_format, ParseOutcome, Record,
-    RecordScratch, SequenceFormat,
+    next_record_start, parse_leading_record, sequence_format, ParseOutcome, Record, RecordScratch,
+    RecordStart, SequenceFormat,
 };
 
 // region: Containers
 
 /// A whole input held in memory or memory-mapped, addressable at any offset.
 ///
-/// Any byte range can go to a worker, since [`next_record_boundary`] recovers a record
+/// Any byte range can go to a worker, since [`crate::records::next_record_boundary`]
+/// recovers a record
 /// boundary from any offset. Generic over its container so one type serves the owner of a
 /// mapping and the borrower of a view of it alike.
 pub struct RandomAccess<B: Deref<Target = [u8]>> {
@@ -203,18 +204,27 @@ impl<R: Read> ForwardAccess<R> {
         if matches!(start, StreamStart::FirstBoundary(_)) {
             let mut searched_through = 0usize;
             loop {
-                match next_record_boundary(&self.window[..filled], searched_through, format) {
-                    Some(boundary) => {
+                match next_record_start(&self.window[..filled], searched_through, format) {
+                    RecordStart::At(boundary) => {
                         consumed = boundary;
                         // The skipped prefix is decoded input too, and `decoded_bytes` counts
                         // from the front of this window, so it must be counted here.
                         parsed_total = boundary;
                         break;
                     }
-                    None if at_eof => return Ok(()),
-                    None => {
-                        // A refill only appends, so the bytes already rejected stay rejected.
-                        searched_through = filled.saturating_sub(3);
+                    // Nothing more will arrive, so an unproven candidate stays unproven.
+                    RecordStart::Undecided(_) | RecordStart::NotFound if at_eof => return Ok(()),
+                    outcome => {
+                        // Resume where the proof ran out of bytes, not where the scan stopped.
+                        // A FASTQ cycle spans four lines, which on a long read is tens of
+                        // kilobytes, so a candidate near the end is undecided rather than
+                        // rejected, and stepping over it drops every record up to the next.
+                        searched_through = match outcome {
+                            RecordStart::Undecided(resume_from) => resume_from,
+                            // Every candidate was judged and rejected; only the newline a
+                            // two-byte needle straddles has to be reconsidered.
+                            _ => filled.saturating_sub(1),
+                        };
                         if filled == self.window.len() {
                             self.window.resize(self.window.len() * 2, 0);
                         }

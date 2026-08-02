@@ -1103,6 +1103,51 @@ mod tests {
         assert!(headers.is_empty());
     }
 
+    /// Reads long enough that a four-line proof outruns the parse window.
+    ///
+    /// A 20 kb nanopore read spans several 64 KB blocks and its cycle is tens of kilobytes, so
+    /// the boundary search a run does at its first block cannot finish inside one window. This
+    /// is the shape that dropped 41 of 2600 records while every short-read fixture passed.
+    #[cfg(feature = "gzip")]
+    #[test]
+    fn long_reads_survive_a_boundary_search_that_outruns_the_window() {
+        let mut plain = Vec::new();
+        for index in 0..24 {
+            let length = 4000 + index * 500;
+            plain.extend_from_slice(format!("@read{index} length={length}\n").as_bytes());
+            plain.extend(std::iter::repeat_n(b'A', length));
+            plain.extend_from_slice(b"\n+\n");
+            plain.extend(std::iter::repeat_n(b'I', length));
+            plain.push(b'\n');
+        }
+        let expected = rendered_serially(&plain);
+        let access = block_access_of(bgzf_bytes(&plain, 4096));
+
+        for threads in [1usize, 2, 4, 8] {
+            let (_topology, mut pool) = pool_of(threads);
+            let mut states: Vec<Vec<u8>> = vec![Vec::new(); threads * 2];
+            let mut written = Vec::new();
+            in_block_runs(
+                &*access,
+                8192,
+                &mut pool,
+                RecordOrder::Preserved,
+                &mut states,
+                render,
+                |state| {
+                    written.extend_from_slice(state);
+                    state.clear();
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                written, expected,
+                "lost or duplicated records at {threads} threads"
+            );
+        }
+    }
+
     /// The block tier reaches the same bytes as a plain buffer, whatever the run size and
     /// however many workers share the input.
     #[cfg(feature = "gzip")]

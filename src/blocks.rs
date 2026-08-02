@@ -1,6 +1,6 @@
 //! Block-addressable containers: BGZF, xz, and lz4.
 //!
-//! A container is block-addressable when its compressed bytes fall into runs that each decode
+//! An input is block-addressable when its compressed bytes fall into runs that each decode
 //! alone, which is what lets several workers read one compressed input. The three formats
 //! answer the same three questions in three different ways — BGZF walks a chain of block
 //! headers, xz reads a footer index, lz4 walks a chain of length prefixes — so [`BlockAccess`]
@@ -24,7 +24,7 @@ use crate::codecs::Codec;
 
 // region: The block tier
 
-/// A container addressable at block granularity, where every block decodes alone.
+/// An input addressable at block granularity, where every block decodes alone.
 ///
 /// `Sync` because a worker pool queries one shared instance while each worker decodes into its
 /// own buffer. Not implemented for streams: a forward-only source has no blocks.
@@ -35,7 +35,7 @@ pub trait BlockAccess: Sync {
     /// truncated tail is missing from the count rather than an error at open.
     fn block_count(&self) -> usize;
 
-    /// Decoded bytes in one block, as far as the container states them.
+    /// Decoded bytes in one block, as far as the input states them.
     ///
     /// # Panics
     ///
@@ -43,7 +43,7 @@ pub trait BlockAccess: Sync {
     /// table has no size to report, and a caller that asks for one has counted wrong.
     fn bytes_in_block(&self, index: usize) -> BlockBytes;
 
-    /// Decoder state for one worker, separate from `&self` because the container is shared and
+    /// Decoder state for one worker, separate from `&self` because the input is shared and
     /// the decoder is not.
     ///
     /// One per worker rather than one per block, so a run of blocks pays for the state once.
@@ -97,13 +97,13 @@ impl DecodedBlock {
     }
 }
 
-/// What a container knows about a block's decoded size before decoding it.
+/// What an input knows about a block's decoded size before decoding it.
 ///
 /// Decoded rather than compressed because poly-A compresses ten to one against ordinary
 /// sequence, so budgeting on compressed bytes hands one worker ten times the work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockBytes {
-    /// The container declares it: a BGZF trailer, an xz index record, an lz4 stored block.
+    /// The input declares it: a BGZF trailer, an xz index record, an lz4 stored block.
     Exact(usize),
     /// A ceiling only: an lz4 compressed block, whose frame states no decoded size at all.
     AtMost(usize),
@@ -126,13 +126,13 @@ impl BlockBytes {
     }
 }
 
-/// One worker's decoder over one container, holding whatever state its format needs.
+/// One worker's decoder over one input, holding whatever state its format needs.
 pub trait BlockDecoder {
     /// Decode block `index` into `out`, replacing what was there.
     ///
     /// # Panics
     ///
-    /// When `index` is at or past the container's block count, for the same reason
+    /// When `index` is at or past the input's block count, for the same reason
     /// [`BlockAccess::bytes_in_block`] does.
     fn decode_into(&mut self, index: usize, out: &mut Vec<u8>) -> io::Result<()>;
 }
@@ -237,7 +237,7 @@ struct BgzfBlockEntry {
 
 /// A BGZF file: blocked gzip, where every block is an independent deflate stream.
 ///
-/// Generic over its container like [`crate::files::RandomAccess`], so one type serves the
+/// Generic over its bytes like [`crate::files::RandomAccess`], so one type serves the
 /// owner of a mapping and the borrower of a view of it alike.
 #[cfg(feature = "gzip")]
 pub struct BgzfAccess<B: Deref<Target = [u8]>> {
@@ -262,7 +262,7 @@ impl<B: Deref<Target = [u8]>> BgzfAccess<B> {
         }
     }
 
-    /// A two-word view of the same bytes, for a worker that must not own the container.
+    /// A two-word view of the same bytes, for a worker that must not own them.
     ///
     /// The view starts with an empty table of its own, so whichever instance the block queries
     /// go through is the one that pays for the walk.
@@ -682,6 +682,9 @@ fn xz_footer(compressed: &[u8], tail: usize) -> Option<XzFooter> {
     let stream_flags = [compressed[tail - 4], compressed[tail - 3]];
     // The check trails every block's payload, and getting its width wrong shifts every payload
     // end in the stream.
+    // Widths from the format's check-identifier table. LZMA2 is self-terminating, so a payload
+    // slice a few bytes too long still decodes correctly and no test can tell one width from
+    // another; the value tightens the slice rather than deciding what is in it.
     let check_bytes = match stream_flags[1] & 0x0F {
         0 => 0usize,
         1..=3 => 4,
@@ -1275,7 +1278,7 @@ mod tests {
         assert!(BgzfAccess::new(&b""[..]).is_err());
     }
 
-    /// Rejection hands the container back, so a caller holding a mapping can read it as a stream
+    /// Rejection hands the bytes back, so a caller holding a mapping can read it as a stream
     /// without mapping the file again.
     #[cfg(feature = "gzip")]
     #[test]
@@ -1287,7 +1290,7 @@ mod tests {
         }
     }
 
-    /// A borrowed view reads exactly what the owning container reads.
+    /// A borrowed view reads exactly what the owner reads.
     #[cfg(feature = "gzip")]
     #[test]
     fn a_borrowed_bgzf_view_inflates_the_same_bytes() {
@@ -1396,6 +1399,32 @@ mod tests {
         let access = XzAccess::new(compressed).unwrap();
         assert_eq!(access.block_count(), 3);
         conforms(&access, &plain, "one stream of three blocks");
+    }
+
+    /// The check trails every payload inside a stream too, so a stream the writer cut into
+    /// blocks locates each payload end from the same two flag bytes.
+    ///
+    /// [`every_xz_check_type_locates_its_payloads`] gives each check type a stream of its own
+    /// holding a single block, which leaves the width untested wherever several payload ends
+    /// hang on it.
+    #[cfg(feature = "xz")]
+    #[test]
+    fn every_xz_check_type_locates_the_blocks_of_one_stream() {
+        // Preset zero puts the dictionary at 256 KiB and the writer will not cut a block below
+        // it, so two blocks need twice that.
+        let block_bytes = 256usize << 10;
+        let plain = fixtures::uniform_records(2 * block_bytes / fixtures::UNIFORM_RECORD_BYTES);
+        for check in [
+            lzma_rust2::CheckType::None,
+            lzma_rust2::CheckType::Crc32,
+            lzma_rust2::CheckType::Crc64,
+            lzma_rust2::CheckType::Sha256,
+        ] {
+            let compressed = fixtures::xz_stream(&plain, Some(block_bytes as u64), check);
+            let access = XzAccess::new(compressed).unwrap();
+            assert_eq!(access.block_count(), 2, "{check:?}");
+            conforms(&access, &plain, &format!("{check:?}"));
+        }
     }
 
     /// A file of one block reads faster as a stream, so it is handed back rather than wrapped.

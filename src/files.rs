@@ -2,7 +2,7 @@
 //!
 //! Two regions:
 //!
-//! - __Containers__ — the three input shapes, and how records are read out of each.
+//! - __Inputs__ — the three shapes an input arrives in, and how records are read out of each.
 //! - __Output__ — record formatting and the boilerplate every `main` shares.
 //!
 //! This layer sits above three others: every record is read through [`crate::records`], a
@@ -21,12 +21,12 @@ use crate::records::{
     RecordBoundary, RecordScratch, SequenceFormat,
 };
 
-// region: Containers
+// region: Inputs
 
 /// A whole input held in memory or memory-mapped, addressable at any offset.
 ///
 /// Any byte range can go to a worker, since [`crate::records::first_record_boundary`] recovers
-/// a record boundary from any offset. Generic over its container so one type serves the owner
+/// a record boundary from any offset. Generic over its bytes so one type serves the owner
 /// of a mapping and the borrower of a view of it alike.
 pub struct RandomAccess<B: Deref<Target = [u8]>> {
     data: B,
@@ -59,12 +59,12 @@ pub enum StreamStart {
 pub const DEFAULT_WINDOW_BYTES: usize = 1 << 20;
 
 impl<B: Deref<Target = [u8]>> RandomAccess<B> {
-    /// Wraps a container that outlives every record read from it.
+    /// Wraps bytes that outlive every record read from them.
     pub fn new(data: B) -> Self {
         Self { data }
     }
 
-    /// A two-word view of the same bytes, for a worker that must not own the container.
+    /// A two-word view of the same bytes, for a worker that must not own them.
     pub fn borrowed(&self) -> RandomAccess<&[u8]> {
         RandomAccess { data: &self.data }
     }
@@ -358,7 +358,7 @@ impl<'a, R: Read> ParseWindow<'a, R> {
 /// — standard input, a named pipe, a file being decompressed a window at a time — is read
 /// once from front to back.
 ///
-/// Each variant owns its container rather than borrowing one, so the enum carries no
+/// Each variant owns its bytes rather than borrowing them, so the enum carries no
 /// lifetime and a worker takes a view through `borrowed` while the mapping stays here.
 pub enum InputFile {
     /// BYTE tier: every offset is addressable, so any byte range can go to a worker.
@@ -417,9 +417,9 @@ impl InputFile {
         let codec = crate::codecs::Codec::detect(&mapping[..prefix_bytes]);
         let mapping = match codec {
             crate::codecs::Codec::Plain => return Ok(InputFile::Bytes(RandomAccess::new(mapping))),
-            // Whether a container is addressable is a second question from which container it
+            // Whether an input is addressable is a second question from which container it
             // is, and only a whole mapping can answer it: a single-block xz file and a blocked
-            // one share every byte of their magic. A container that declines hands the mapping
+            // one share every byte of their magic. An input that declines hands the mapping
             // back and reads as a stream.
             #[cfg(any(feature = "gzip", feature = "xz", feature = "lz4"))]
             _ => match crate::blocks::block_access(mapping, codec) {
@@ -462,7 +462,7 @@ fn at_source(name: &str, error: &io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{name}: {error}"))
 }
 
-// endregion: Containers
+// endregion: Inputs
 
 // region: Output
 
@@ -930,7 +930,7 @@ mod tests {
         assert_eq!(drive_bytes(&data).unwrap().records, 3);
     }
 
-    /// A worker reads through a view while the container stays with its owner.
+    /// A worker reads through a view while the bytes stay with their owner.
     #[test]
     fn a_borrowed_view_yields_the_same_records() {
         let data = fixtures::records(fixtures::WRAPPED_FASTA, 12);
@@ -1024,6 +1024,55 @@ mod tests {
                         data.len()
                     );
                 }
+            }
+        }
+    }
+
+    /// `decoded_bytes` counts the prefix a window skips, because both are measured from the
+    /// front of the window and those bytes are decoded input.
+    ///
+    /// [`a_split_buffer_tiles_the_same_records`] never pairs the two: its head opens on a record
+    /// and its tail states no `decoded_bytes`. Three windows that each open mid-record and each
+    /// state one do, and a run counting only from its first record would read past its end and
+    /// re-emit records the run before it owns.
+    #[test]
+    fn decoded_bytes_counts_the_prefix_a_window_skips() {
+        for shape in fixtures::ALL {
+            let data = fixtures::records(shape, fixtures::count_within(shape, 4 << 10));
+            let format = shape.format;
+            // Sevenths, so a window opens well inside a record rather than on the boundary a
+            // half or a third of a ragged fixture tends to land near.
+            let starts = [1usize, 3, 5].map(|seventh| data.len() * seventh / 7);
+
+            for window_bytes in [64usize, 256, 4096] {
+                let whole = records_within(
+                    &data[starts[0]..],
+                    window_bytes,
+                    StreamStart::FirstBoundary(format),
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("{shape:?}, {window_bytes}-byte window: {error}"));
+                assert!(!whole.is_empty(), "{shape:?}: the fixture holds no records");
+
+                let mut tiled = Vec::new();
+                for (index, &start) in starts.iter().enumerate() {
+                    let end = starts.get(index + 1).copied().unwrap_or(data.len());
+                    tiled.extend(
+                        records_within(
+                            &data[start..],
+                            window_bytes,
+                            StreamStart::FirstBoundary(format),
+                            Some(end - start),
+                        )
+                        .unwrap(),
+                    );
+                }
+                assert_eq!(
+                    tiled,
+                    whole,
+                    "{shape:?}, {window_bytes}-byte window, windows at {starts:?} of {}",
+                    data.len()
+                );
             }
         }
     }

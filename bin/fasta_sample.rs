@@ -19,7 +19,9 @@ use std::io::{self, Write};
 
 use clap::Parser;
 
-use faster_fasta::{finish_or_exit, map_reduce, digest, open_output, Record, RecordKey, Rendering, RecordWriter, SequenceFormat};
+use fasterfasta::files::{finish_or_exit, open_output, RecordWriter, Rendering};
+use fasterfasta::records::{digest, Record, RecordKey, SequenceFormat};
+use fasterfasta::scheduling::{for_each_record_in_inputs, Parallelism};
 
 /// Whether a record with this key survives a `--fraction` pass.
 fn keeps(key: u64, probability: f64) -> bool {
@@ -32,6 +34,7 @@ fn keeps(key: u64, probability: f64) -> bool {
     (key as f64) < probability * (u64::MAX as f64)
 }
 
+#[derive(Debug, Clone, Copy)]
 enum Mode {
     /// Keep each record independently with the given probability.
     Fraction(f64),
@@ -47,6 +50,9 @@ enum Mode {
 struct Kept {
     /// Leads the struct so the derived ordering is by key, which is what the heap needs.
     key: u64,
+    /// A globally monotone index. Each state counts from zero over the byte range it took,
+    /// and [`Sampler::absorb`] rebases that count onto the records already absorbed, so two
+    /// ranges cannot both claim arrival zero and interleave in the sort.
     arrival: u64,
     rendered: Vec<u8>,
 }
@@ -59,6 +65,8 @@ struct Sampler<W: Write> {
     seen: u64,
     /// Records held by `Mode::Count`; always empty under `Mode::Fraction`.
     kept: BinaryHeap<Kept>,
+    /// Records written out, counted where they leave rather than where they are chosen.
+    retained: u64,
 }
 
 impl<W: Write> Sampler<W> {
@@ -70,9 +78,9 @@ impl<W: Write> Sampler<W> {
             seen: 0,
             // Grown as records are kept, so `--count` cannot ask for an allocation up front.
             kept: BinaryHeap::new(),
+            retained: 0,
         }
     }
-
 
     fn push(&mut self, record: Record<'_>) -> io::Result<()> {
         self.writer.adopt(record.format())?;
@@ -84,6 +92,7 @@ impl<W: Write> Sampler<W> {
             Mode::Fraction(probability) => {
                 if keeps(key, probability) {
                     self.writer.write_record(record)?;
+                    self.retained += 1;
                 }
             }
             Mode::Count(count) => {
@@ -108,6 +117,34 @@ impl<W: Write> Sampler<W> {
         Ok(())
     }
 
+    /// Fold one state's work into this sampler, which the driver calls in input order.
+    ///
+    /// The reservoir merges by construction, since the `count` smallest keys of the union are
+    /// the `count` smallest of the merged heaps.
+    fn absorb(&mut self, state: &mut Sampler<Vec<u8>>) -> io::Result<()> {
+        // A `--fraction` state writes as it goes, so its buffer is already rendered records.
+        let buffered = state.writer.inner_mut();
+        self.writer.write_rendered(buffered)?;
+        buffered.clear();
+        self.retained += state.retained;
+        state.retained = 0;
+
+        let capacity = match self.mode {
+            Mode::Count(count) => count,
+            Mode::Fraction(_) => 0,
+        };
+        for mut entry in state.kept.drain() {
+            entry.arrival += self.seen;
+            self.kept.push(entry);
+            if self.kept.len() > capacity {
+                self.kept.pop();
+            }
+        }
+        self.seen += state.seen;
+        state.seen = 0;
+        Ok(())
+    }
+
     fn finish(&mut self) -> io::Result<()> {
         // Selection is order-independent, but the output is not: records leave in the order
         // they arrived, so a coordinate-sorted input stays sorted.
@@ -115,6 +152,7 @@ impl<W: Write> Sampler<W> {
         kept.sort_unstable_by_key(|entry| entry.arrival);
         for entry in kept {
             self.writer.write_rendered(&entry.rendered)?;
+            self.retained += 1;
         }
         self.writer.flush()
     }
@@ -147,6 +185,13 @@ struct Args {
     /// Seed for reproducible sampling
     #[arg(short = 's', long, default_value_t = 42)]
     seed: u64,
+
+    /// Report how many records were examined and retained, on standard error
+    #[arg(long)]
+    report: bool,
+
+    #[command(flatten)]
+    parallelism: Parallelism,
 }
 
 fn main() {
@@ -169,16 +214,31 @@ fn main() {
         }
     };
 
-    let result = (|| {
+    let report = args.report;
+
+    let result = (|| -> io::Result<()> {
         let rendering = Rendering::for_output(args.output.as_deref());
         let output = open_output(args.output.as_deref())?;
-        let mut sampler = Sampler::new(output, mode, args.seed, rendering);
-        map_reduce::for_each_record_at_paths(
+        let mut workers = args.parallelism.ordered()?;
+        // One sampler per byte range in flight, each folded into `combined` in input order.
+        let mut states = workers.states(|| Sampler::new(Vec::new(), mode, args.seed, rendering));
+        let mut combined = Sampler::new(output, mode, args.seed, rendering);
+
+        for_each_record_in_inputs(
             &args.inputs,
-            &mut sampler,
+            &mut workers,
+            &mut states,
             Sampler::push,
+            |state| combined.absorb(state),
         )?;
-        sampler.finish()
+        combined.finish()?;
+        if report {
+            eprintln!(
+                "examined {} records, retained {}",
+                combined.seen, combined.retained
+            );
+        }
+        Ok(())
     })();
 
     finish_or_exit("Error sampling records", result);
@@ -187,10 +247,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fasterfasta::scheduling::for_each_record_in_bytes;
 
-    fn sample(data: &[u8], format: SequenceFormat, mode: Mode, seed: u64) -> String {
+    fn sample(data: &[u8], mode: Mode, seed: u64) -> String {
         let mut sampler = Sampler::new(Vec::new(), mode, seed, Rendering::PLAIN);
-        map_reduce::for_each_record_in_bytes(data, &mut sampler, Sampler::push).unwrap();
+        for_each_record_in_bytes(data, &mut sampler, Sampler::push).unwrap();
         sampler.finish().unwrap();
         String::from_utf8(sampler.writer.into_inner()).unwrap()
     }
@@ -210,41 +271,39 @@ mod tests {
     #[test]
     fn count_keeps_exactly_that_many() {
         let data = fasta(100);
-        let out = sample(&data, SequenceFormat::Fasta, Mode::Count(10), 42);
+        let out = sample(&data, Mode::Count(10), 42);
         assert_eq!(out.matches('>').count(), 10);
     }
 
     #[test]
     fn count_larger_than_input_keeps_everything() {
         let data = fasta(5);
-        let out = sample(&data, SequenceFormat::Fasta, Mode::Count(50), 42);
+        let out = sample(&data, Mode::Count(50), 42);
         assert_eq!(out.matches('>').count(), 5);
     }
 
     #[test]
     fn same_seed_reproduces_the_sample() {
         let data = fasta(100);
-        let first = sample(&data, SequenceFormat::Fasta, Mode::Count(10), 7);
-        let second = sample(&data, SequenceFormat::Fasta, Mode::Count(10), 7);
+        let first = sample(&data, Mode::Count(10), 7);
+        let second = sample(&data, Mode::Count(10), 7);
         assert_eq!(first, second);
     }
 
     #[test]
     fn different_seeds_give_different_samples() {
         let data = fasta(1000);
-        let first = sample(&data, SequenceFormat::Fasta, Mode::Count(10), 1);
-        let second = sample(&data, SequenceFormat::Fasta, Mode::Count(10), 2);
+        let first = sample(&data, Mode::Count(10), 1);
+        let second = sample(&data, Mode::Count(10), 2);
         assert_ne!(first, second);
     }
 
     #[test]
     fn fraction_zero_keeps_nothing_and_one_keeps_all() {
         let data = fasta(50);
-        assert_eq!(sample(&data, SequenceFormat::Fasta, Mode::Fraction(0.0), 42), "");
+        assert_eq!(sample(&data, Mode::Fraction(0.0), 42), "");
         assert_eq!(
-            sample(&data, SequenceFormat::Fasta, Mode::Fraction(1.0), 42)
-                .matches('>')
-                .count(),
+            sample(&data, Mode::Fraction(1.0), 42).matches('>').count(),
             50
         );
     }
@@ -252,9 +311,7 @@ mod tests {
     #[test]
     fn fraction_lands_near_the_requested_share() {
         let data = fasta(10_000);
-        let kept = sample(&data, SequenceFormat::Fasta, Mode::Fraction(0.1), 42)
-            .matches('>')
-            .count();
+        let kept = sample(&data, Mode::Fraction(0.1), 42).matches('>').count();
         assert!((900..1100).contains(&kept), "kept {kept} of 10000 at p=0.1");
     }
 
@@ -262,7 +319,7 @@ mod tests {
     #[test]
     fn fastq_records_keep_their_quality() {
         let data = b"@read0\nACGT\n+\nIIII\n@read1\nTGCA\n+\nHHHH\n";
-        let out = sample(data, SequenceFormat::Fastq, Mode::Count(2), 42);
+        let out = sample(data, Mode::Count(2), 42);
         assert!(out.contains("IIII"), "{out}");
         assert!(out.contains("HHHH"), "{out}");
     }
@@ -276,9 +333,9 @@ mod tests {
         let tail = fasta_range(100, 200);
         let whole = [head.clone(), tail.clone()].concat();
 
-        let from_whole = sample(&whole, SequenceFormat::Fasta, Mode::Fraction(0.2), 7);
-        let mut from_halves = sample(&head, SequenceFormat::Fasta, Mode::Fraction(0.2), 7);
-        from_halves.push_str(&sample(&tail, SequenceFormat::Fasta, Mode::Fraction(0.2), 7));
+        let from_whole = sample(&whole, Mode::Fraction(0.2), 7);
+        let mut from_halves = sample(&head, Mode::Fraction(0.2), 7);
+        from_halves.push_str(&sample(&tail, Mode::Fraction(0.2), 7));
 
         assert_eq!(from_halves, from_whole);
     }
@@ -301,18 +358,38 @@ mod tests {
                 .collect()
         };
 
-        let kept_first = strip(sample(&first, SequenceFormat::Fastq, Mode::Fraction(0.25), 3), "/1");
-        let kept_second = strip(sample(&second, SequenceFormat::Fastq, Mode::Fraction(0.25), 3), "/2");
+        let kept_first = strip(sample(&first, Mode::Fraction(0.25), 3), "/1");
+        let kept_second = strip(sample(&second, Mode::Fraction(0.25), 3), "/2");
 
         assert!(!kept_first.is_empty(), "sampled nothing");
         assert_eq!(kept_first, kept_second);
+    }
+
+    /// Two byte ranges each stamp arrival from zero, so absorbing has to rebase them or the
+    /// sort in `finish` interleaves the halves.
+    #[test]
+    fn absorbing_two_states_keeps_input_order() {
+        let head = fasta_range(0, 100);
+        let tail = fasta_range(100, 200);
+        let whole = [head.clone(), tail.clone()].concat();
+
+        let mut combined = Sampler::new(Vec::new(), Mode::Count(20), 7, Rendering::PLAIN);
+        for part in [&head, &tail] {
+            let mut state = Sampler::new(Vec::new(), Mode::Count(20), 7, Rendering::PLAIN);
+            for_each_record_in_bytes(part, &mut state, Sampler::push).unwrap();
+            combined.absorb(&mut state).unwrap();
+        }
+        combined.finish().unwrap();
+
+        let from_states = String::from_utf8(combined.writer.into_inner()).unwrap();
+        assert_eq!(from_states, sample(&whole, Mode::Count(20), 7));
     }
 
     /// Selection is order-independent, but output is not: records leave as they arrived.
     #[test]
     fn output_preserves_input_order() {
         let data = fasta(100);
-        let out = sample(&data, SequenceFormat::Fasta, Mode::Count(10), 42);
+        let out = sample(&data, Mode::Count(10), 42);
         let order: Vec<usize> = out
             .lines()
             .filter(|line| line.starts_with('>'))
@@ -327,13 +404,31 @@ mod tests {
     #[test]
     fn absurd_count_does_not_preallocate() {
         let data = fasta(5);
-        let out = sample(&data, SequenceFormat::Fasta, Mode::Count(1_000_000_000), 42);
+        let out = sample(&data, Mode::Count(1_000_000_000), 42);
         assert_eq!(out.matches('>').count(), 5);
     }
 
     #[test]
     fn empty_input_produces_nothing() {
-        assert_eq!(sample(b"", SequenceFormat::Fasta, Mode::Count(10), 42), "");
-        assert_eq!(sample(b"", SequenceFormat::Fasta, Mode::Fraction(0.5), 42), "");
+        assert_eq!(sample(b"", Mode::Count(10), 42), "");
+        assert_eq!(sample(b"", Mode::Fraction(0.5), 42), "");
+    }
+
+    /// Both modes write from a different place, so both are counted here.
+    #[test]
+    fn counts_are_tracked() {
+        let data = fasta(100);
+
+        let mut reservoir = Sampler::new(Vec::new(), Mode::Count(10), 42, Rendering::PLAIN);
+        for_each_record_in_bytes(&data, &mut reservoir, Sampler::push).unwrap();
+        reservoir.finish().unwrap();
+        assert_eq!(reservoir.seen, 100);
+        assert_eq!(reservoir.retained, 10);
+
+        let mut fraction = Sampler::new(Vec::new(), Mode::Fraction(1.0), 42, Rendering::PLAIN);
+        for_each_record_in_bytes(&data, &mut fraction, Sampler::push).unwrap();
+        fraction.finish().unwrap();
+        assert_eq!(fraction.seen, 100);
+        assert_eq!(fraction.retained, 100);
     }
 }

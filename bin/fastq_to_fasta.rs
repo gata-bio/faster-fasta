@@ -18,7 +18,9 @@ use std::io::{self, Write};
 
 use clap::Parser;
 
-use faster_fasta::{finish_or_exit, map_reduce, mean_quality, open_output, Record, Rendering, RecordWriter, SequenceFormat};
+use fasterfasta::files::{finish_or_exit, open_output, RecordWriter, Rendering};
+use fasterfasta::records::{mean_quality, Record, SequenceFormat};
+use fasterfasta::scheduling::{for_each_record_in_inputs, Parallelism};
 
 struct FastaConverter<W: Write> {
     writer: RecordWriter<W>,
@@ -56,10 +58,6 @@ impl<W: Write> FastaConverter<W> {
         self.converted += 1;
         Ok(())
     }
-
-    fn finish(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
 }
 
 /// Convert FASTQ to FASTA
@@ -81,21 +79,49 @@ struct Args {
     /// Keep only records whose mean quality is at least this Phred score
     #[arg(short = 'q', long)]
     min_quality: Option<f32>,
+
+    /// Report how many records were converted and skipped, on standard error
+    #[arg(long)]
+    report: bool,
+
+    #[command(flatten)]
+    parallelism: Parallelism,
 }
 
 fn main() {
     let args = Args::parse();
 
-    let result = (|| {
+    let report = args.report;
+
+    let result = (|| -> io::Result<()> {
         let rendering = Rendering::for_output(args.output.as_deref());
-        let output = open_output(args.output.as_deref())?;
-        let mut converter = FastaConverter::new(output, args.min_quality, rendering);
-        map_reduce::for_each_record_at_paths(
+        let mut output = open_output(args.output.as_deref())?;
+        let mut workers = args.parallelism.ordered()?;
+        // Each state buffers the records of one byte range, and `retire` writes that buffer
+        // out in turn, so the output is the same bytes however many workers ran.
+        let mut states =
+            workers.states(|| FastaConverter::new(Vec::new(), args.min_quality, rendering));
+
+        for_each_record_in_inputs(
             &args.inputs,
-            &mut converter,
+            &mut workers,
+            &mut states,
             FastaConverter::push,
+            |state| {
+                let buffered = state.writer.inner_mut();
+                output.write_all(buffered)?;
+                buffered.clear();
+                Ok(())
+            },
         )?;
-        converter.finish()
+        output.flush()?;
+
+        if report {
+            let converted: usize = states.iter().map(|state| state.converted).sum();
+            let skipped: usize = states.iter().map(|state| state.skipped).sum();
+            eprintln!("converted {converted} records, skipped {skipped}");
+        }
+        Ok(())
     })();
 
     finish_or_exit("Error converting FASTQ", result);
@@ -104,24 +130,23 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fasterfasta::scheduling::for_each_record_in_bytes;
 
     /// A FASTA record has no quality, so a mean-quality threshold would silently reject
     /// every record and exit successfully. It is an error instead.
     #[test]
     fn quality_threshold_on_fasta_is_rejected() {
         let mut tool = FastaConverter::new(Vec::new(), Some(30.0), Rendering::PLAIN);
-        let error = map_reduce::for_each_record_in_bytes(b">a\nACGT\n>b\nTTTT\n", &mut tool, FastaConverter::push)
-        .unwrap_err();
+        let error =
+            for_each_record_in_bytes(b">a\nACGT\n>b\nTTTT\n", &mut tool, FastaConverter::push)
+                .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("--min-quality"), "{error}");
     }
-    
+
     fn convert(data: &[u8], minimum_quality: Option<f32>) -> String {
         let mut converter = FastaConverter::new(Vec::new(), minimum_quality, Rendering::PLAIN);
-        map_reduce::for_each_record_in_bytes(
-            data,
-            &mut converter,
-            FastaConverter::push).unwrap();
+        for_each_record_in_bytes(data, &mut converter, FastaConverter::push).unwrap();
         String::from_utf8(converter.writer.into_inner()).unwrap()
     }
 
@@ -158,10 +183,7 @@ mod tests {
     fn counts_are_tracked() {
         let data = b"@high\nACGT\n+\nIIII\n@low\nTGCA\n+\n####\n";
         let mut converter = FastaConverter::new(Vec::new(), Some(30.0), Rendering::PLAIN);
-        map_reduce::for_each_record_in_bytes(
-            data,
-            &mut converter,
-            FastaConverter::push).unwrap();
+        for_each_record_in_bytes(data, &mut converter, FastaConverter::push).unwrap();
         assert_eq!(converter.converted, 1);
         assert_eq!(converter.skipped, 1);
     }

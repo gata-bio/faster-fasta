@@ -18,7 +18,9 @@ use std::io::{self, Write};
 use clap::Parser;
 use stringzilla::sz::lookup;
 
-use faster_fasta::{finish_or_exit, map_reduce, open_output, Record, Rendering, RecordWriter, SequenceFormat};
+use fasterfasta::files::{finish_or_exit, open_output, RecordWriter, Rendering};
+use fasterfasta::records::{Record, SequenceFormat};
+use fasterfasta::scheduling::{for_each_record_in_inputs, Parallelism};
 
 /// Thymine to uracil in both cases; every other byte maps to itself.
 fn transcription_table() -> [u8; 256] {
@@ -35,6 +37,7 @@ struct Transcriber<W: Write> {
     writer: RecordWriter<W>,
     table: [u8; 256],
     scratch: Vec<u8>,
+    converted: u64,
 }
 
 impl<W: Write> Transcriber<W> {
@@ -43,6 +46,7 @@ impl<W: Write> Transcriber<W> {
             writer: RecordWriter::with_rendering(writer, rendering, format),
             table: transcription_table(),
             scratch: Vec::new(),
+            converted: 0,
         }
     }
 
@@ -54,12 +58,13 @@ impl<W: Write> Transcriber<W> {
         }
         lookup(&mut self.scratch[..length], record.sequence, self.table);
 
-        self.writer
-            .write_parts(record.header_without_sigil(), &self.scratch[..length], record.quality)
-    }
-
-    fn finish(&mut self) -> io::Result<()> {
-        self.writer.flush()
+        self.writer.write_parts(
+            record.header_without_sigil(),
+            &self.scratch[..length],
+            record.quality,
+        )?;
+        self.converted += 1;
+        Ok(())
     }
 }
 
@@ -78,22 +83,47 @@ struct Args {
     /// Output file; '-' or omitted writes standard output
     #[arg(short, long)]
     output: Option<String>,
+
+    /// Report how many records were converted, on standard error
+    #[arg(long)]
+    report: bool,
+
+    #[command(flatten)]
+    parallelism: Parallelism,
 }
 
 fn main() {
     let args = Args::parse();
+    let report = args.report;
 
-    let result = (|| {
+    let result = (|| -> io::Result<()> {
         let rendering = Rendering::for_output(args.output.as_deref());
-        let output = open_output(args.output.as_deref())?;
-        // The placeholder format is replaced by `begin` before any record arrives.
-        let mut transcriber = Transcriber::new(output, SequenceFormat::Fasta, rendering);
-        map_reduce::for_each_record_at_paths(
+        let mut output = open_output(args.output.as_deref())?;
+        let mut workers = args.parallelism.ordered()?;
+        // Each state buffers the records of one byte range, and `retire` writes that buffer
+        // out in turn, so the output is the same bytes however many workers ran.
+        let mut states =
+            workers.states(|| Transcriber::new(Vec::new(), SequenceFormat::Fasta, rendering));
+
+        for_each_record_in_inputs(
             &args.inputs,
-            &mut transcriber,
+            &mut workers,
+            &mut states,
             Transcriber::push,
+            |state| {
+                let buffered = state.writer.inner_mut();
+                output.write_all(buffered)?;
+                buffered.clear();
+                Ok(())
+            },
         )?;
-        transcriber.finish()
+        output.flush()?;
+
+        if report {
+            let converted: u64 = states.iter().map(|state| state.converted).sum();
+            eprintln!("converted {converted} records");
+        }
+        Ok(())
     })();
 
     finish_or_exit("Error transcribing", result);
@@ -102,10 +132,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+    use fasterfasta::scheduling::for_each_record_in_bytes;
+
     fn transcribe(data: &[u8], format: SequenceFormat) -> String {
         let mut transcriber = Transcriber::new(Vec::new(), format, Rendering::PLAIN);
-        map_reduce::for_each_record_in_bytes(data, &mut transcriber, Transcriber::push).unwrap();
+        for_each_record_in_bytes(data, &mut transcriber, Transcriber::push).unwrap();
         String::from_utf8(transcriber.writer.into_inner()).unwrap()
     }
 
@@ -155,5 +186,13 @@ mod tests {
             transcribe(b">seq1\nAT\nGT\n", SequenceFormat::Fasta),
             ">seq1\nAUGU\n"
         );
+    }
+
+    #[test]
+    fn counts_are_tracked() {
+        let data = b">a\nTTTT\n>b\nAAAA\n>c\nATAT\n";
+        let mut transcriber = Transcriber::new(Vec::new(), SequenceFormat::Fasta, Rendering::PLAIN);
+        for_each_record_in_bytes(data, &mut transcriber, Transcriber::push).unwrap();
+        assert_eq!(transcriber.converted, 3);
     }
 }

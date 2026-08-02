@@ -20,7 +20,9 @@ use std::io::{self, Write};
 use clap::Parser;
 use stringzilla::sz::{find_byteset, lookup, Byteset};
 
-use faster_fasta::{finish_or_exit, map_reduce, open_output, Record, Rendering, RecordWriter, SequenceFormat};
+use fasterfasta::files::{finish_or_exit, open_output, RecordWriter, Rendering};
+use fasterfasta::records::{Record, SequenceFormat};
+use fasterfasta::scheduling::{for_each_record_in_inputs, Parallelism};
 
 /// Complement table over the full IUPAC nucleotide alphabet, in both cases.
 ///
@@ -84,6 +86,7 @@ struct ReverseComplementer<W: Write> {
     rna_table: [u8; 256],
     sequence_scratch: Vec<u8>,
     quality_scratch: Vec<u8>,
+    converted: u64,
 }
 
 impl<W: Write> ReverseComplementer<W> {
@@ -94,6 +97,7 @@ impl<W: Write> ReverseComplementer<W> {
             rna_table: rna_complement_table(),
             sequence_scratch: Vec::new(),
             quality_scratch: Vec::new(),
+            converted: 0,
         }
     }
 }
@@ -108,7 +112,6 @@ fn scratch_of(buffer: &mut Vec<u8>, length: usize) -> &mut [u8] {
 }
 
 impl<W: Write> ReverseComplementer<W> {
-
     fn push(&mut self, record: Record<'_>) -> io::Result<()> {
         self.writer.adopt(record.format())?;
         // Uracil standing in for thymine means RNA, where adenine must complement back to
@@ -133,11 +136,9 @@ impl<W: Write> ReverseComplementer<W> {
             record.header_without_sigil(),
             &self.sequence_scratch[..record.sequence.len()],
             &self.quality_scratch[..record.quality.len()],
-        )
-    }
-
-    fn finish(&mut self) -> io::Result<()> {
-        self.writer.flush()
+        )?;
+        self.converted += 1;
+        Ok(())
     }
 }
 
@@ -156,22 +157,47 @@ struct Args {
     /// Output file; '-' or omitted writes standard output
     #[arg(short, long)]
     output: Option<String>,
+
+    /// Report how many records were converted, on standard error
+    #[arg(long)]
+    report: bool,
+
+    #[command(flatten)]
+    parallelism: Parallelism,
 }
 
 fn main() {
     let args = Args::parse();
+    let report = args.report;
 
-    let result = (|| {
+    let result = (|| -> io::Result<()> {
         let rendering = Rendering::for_output(args.output.as_deref());
-        let output = open_output(args.output.as_deref())?;
-        // The placeholder format is replaced by `begin` before any record arrives.
-        let mut complementer = ReverseComplementer::new(output, SequenceFormat::Fasta, rendering);
-        map_reduce::for_each_record_at_paths(
+        let mut output = open_output(args.output.as_deref())?;
+        let mut workers = args.parallelism.ordered()?;
+        // Each state buffers the records of one byte range, and `retire` writes that buffer
+        // out in turn, so the output is the same bytes however many workers ran.
+        let mut states = workers
+            .states(|| ReverseComplementer::new(Vec::new(), SequenceFormat::Fasta, rendering));
+
+        for_each_record_in_inputs(
             &args.inputs,
-            &mut complementer,
+            &mut workers,
+            &mut states,
             ReverseComplementer::push,
+            |state| {
+                let buffered = state.writer.inner_mut();
+                output.write_all(buffered)?;
+                buffered.clear();
+                Ok(())
+            },
         )?;
-        complementer.finish()
+        output.flush()?;
+
+        if report {
+            let converted: u64 = states.iter().map(|state| state.converted).sum();
+            eprintln!("converted {converted} records");
+        }
+        Ok(())
     })();
 
     finish_or_exit("Error reverse complementing", result);
@@ -180,10 +206,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+    use fasterfasta::scheduling::for_each_record_in_bytes;
+
     fn revcomp(data: &[u8], format: SequenceFormat) -> String {
         let mut complementer = ReverseComplementer::new(Vec::new(), format, Rendering::PLAIN);
-        map_reduce::for_each_record_in_bytes(data, &mut complementer, ReverseComplementer::push).unwrap();
+        for_each_record_in_bytes(data, &mut complementer, ReverseComplementer::push).unwrap();
         String::from_utf8(complementer.writer.into_inner()).unwrap()
     }
 
@@ -220,8 +247,8 @@ mod tests {
         );
     }
 
-    /// The FASTQ path had no test at all previously, so this is the first coverage of
-    /// quality reversal.
+    /// Quality runs backwards with the sequence, so a reversed read still pairs each base
+    /// with its own score.
     #[test]
     fn reverses_quality_alongside_sequence() {
         assert_eq!(
@@ -260,12 +287,19 @@ mod tests {
     #[test]
     fn scratch_is_reused_across_records() {
         let data = b">a\nACGT\n>b\nACGTACGT\n>c\nAC\n";
-        let mut complementer = ReverseComplementer::new(Vec::new(), SequenceFormat::Fasta, Rendering::PLAIN);
-        map_reduce::for_each_record_in_bytes(
-            data,
-            &mut complementer,
-            ReverseComplementer::push).unwrap();
+        let mut complementer =
+            ReverseComplementer::new(Vec::new(), SequenceFormat::Fasta, Rendering::PLAIN);
+        for_each_record_in_bytes(data, &mut complementer, ReverseComplementer::push).unwrap();
         // Sized to the longest record, never to the sum of them.
         assert_eq!(complementer.sequence_scratch.len(), 8);
+    }
+
+    #[test]
+    fn counts_are_tracked() {
+        let data = b">a\nACGT\n>b\nACGTACGT\n>c\nAC\n";
+        let mut complementer =
+            ReverseComplementer::new(Vec::new(), SequenceFormat::Fasta, Rendering::PLAIN);
+        for_each_record_in_bytes(data, &mut complementer, ReverseComplementer::push).unwrap();
+        assert_eq!(complementer.converted, 3);
     }
 }

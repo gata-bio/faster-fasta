@@ -17,7 +17,9 @@ use std::io::{self, Write};
 
 use clap::Parser;
 
-use faster_fasta::{finish_or_exit, map_reduce, mean_quality, open_output, Record, Rendering, RecordWriter, SequenceFormat};
+use fasterfasta::files::{finish_or_exit, open_output, RecordWriter, Rendering};
+use fasterfasta::records::{mean_quality, Record, SequenceFormat};
+use fasterfasta::scheduling::{for_each_record_in_inputs, Parallelism};
 
 /// Every criterion is optional; a `None` never rejects anything.
 #[derive(Debug, Clone, Copy, Default)]
@@ -116,10 +118,6 @@ impl<W: Write> Filter<W> {
         self.retained += 1;
         Ok(())
     }
-
-    fn finish(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
 }
 
 /// Filter records by quality, length, and ambiguity
@@ -153,6 +151,13 @@ struct Args {
     /// Maximum fraction of N bases, between 0.0 and 1.0
     #[arg(short = 'n', long)]
     max_n_fraction: Option<f32>,
+
+    /// Report how many records were examined, retained, and dropped, on standard error
+    #[arg(long)]
+    report: bool,
+
+    #[command(flatten)]
+    parallelism: Parallelism,
 }
 
 fn main() {
@@ -165,18 +170,41 @@ fn main() {
         maximum_n_fraction: args.max_n_fraction,
     };
 
-    let result = (|| {
+    let report = args.report;
+
+    let result = (|| -> io::Result<()> {
         // Config is checked before any input is opened, so a contradiction fails at once.
         criteria.validate()?;
         let rendering = Rendering::for_output(args.output.as_deref());
-        let output = open_output(args.output.as_deref())?;
-        let mut filter = Filter::new(output, criteria, rendering);
-        map_reduce::for_each_record_at_paths(
+        let mut output = open_output(args.output.as_deref())?;
+        let mut workers = args.parallelism.ordered()?;
+        // Each state buffers the records of one byte range, and `retire` writes that buffer
+        // out in turn, so the output is the same bytes however many workers ran.
+        let mut states = workers.states(|| Filter::new(Vec::new(), criteria, rendering));
+
+        for_each_record_in_inputs(
             &args.inputs,
-            &mut filter,
+            &mut workers,
+            &mut states,
             Filter::push,
+            |state| {
+                let buffered = state.writer.inner_mut();
+                output.write_all(buffered)?;
+                buffered.clear();
+                Ok(())
+            },
         )?;
-        filter.finish()
+        output.flush()?;
+
+        if report {
+            let examined: usize = states.iter().map(|state| state.examined).sum();
+            let retained: usize = states.iter().map(|state| state.retained).sum();
+            eprintln!(
+                "examined {examined} records, retained {retained}, dropped {}",
+                examined - retained
+            );
+        }
+        Ok(())
     })();
 
     finish_or_exit("Error filtering records", result);
@@ -185,25 +213,26 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fasterfasta::scheduling::for_each_record_in_bytes;
 
     /// A FASTA record has no quality, so a mean-quality threshold would silently reject
     /// every record and exit successfully. It is an error instead.
     #[test]
     fn quality_threshold_on_fasta_is_rejected() {
-        let criteria = Criteria { minimum_quality: Some(30.0), ..Default::default() };
+        let criteria = Criteria {
+            minimum_quality: Some(30.0),
+            ..Default::default()
+        };
         let mut tool = Filter::new(Vec::new(), criteria, Rendering::PLAIN);
-        let error = map_reduce::for_each_record_in_bytes(b">a\nACGT\n>b\nTTTT\n", &mut tool, Filter::push)
-        .unwrap_err();
+        let error =
+            for_each_record_in_bytes(b">a\nACGT\n>b\nTTTT\n", &mut tool, Filter::push).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("--min-quality"), "{error}");
     }
-    
+
     fn filter(data: &[u8], criteria: Criteria) -> String {
         let mut filter = Filter::new(Vec::new(), criteria, Rendering::PLAIN);
-        map_reduce::for_each_record_in_bytes(
-            data,
-            &mut filter,
-            Filter::push).unwrap();
+        for_each_record_in_bytes(data, &mut filter, Filter::push).unwrap();
         String::from_utf8(filter.writer.into_inner()).unwrap()
     }
 
@@ -264,7 +293,10 @@ mod tests {
 
     #[test]
     fn no_criteria_keeps_everything() {
-        assert_eq!(filter(MIXED, Criteria::default()), String::from_utf8(MIXED.to_vec()).unwrap());
+        assert_eq!(
+            filter(MIXED, Criteria::default()),
+            String::from_utf8(MIXED.to_vec()).unwrap()
+        );
     }
 
     #[test]
@@ -308,10 +340,7 @@ mod tests {
             ..Default::default()
         };
         let mut filter = Filter::new(Vec::new(), criteria, Rendering::PLAIN);
-        map_reduce::for_each_record_in_bytes(
-            MIXED,
-            &mut filter,
-            Filter::push).unwrap();
+        for_each_record_in_bytes(MIXED, &mut filter, Filter::push).unwrap();
         assert_eq!(filter.examined, 2);
         assert_eq!(filter.retained, 1);
     }

@@ -24,10 +24,9 @@ use clap::Parser;
 
 use stringzilla::sz::{find_byteset, rfind_byteset, Byteset};
 
-use faster_fasta::{
-    finish_or_exit, map_reduce, open_output, phred33_to_ascii, Record, RecordWriter, Rendering,
-    SequenceFormat,
-};
+use fasterfasta::files::{finish_or_exit, open_output, RecordWriter, Rendering};
+use fasterfasta::records::{phred33_to_ascii, Record, SequenceFormat};
+use fasterfasta::scheduling::{for_each_record_in_inputs, Parallelism};
 
 #[derive(Debug, Clone, Copy, Default)]
 struct TrimSettings {
@@ -83,7 +82,7 @@ impl TrimSettings {
     }
 
     fn keeps(&self, length: usize) -> bool {
-        !self.minimum_length.is_some_and(|minimum| length < minimum)
+        self.minimum_length.is_none_or(|minimum| length >= minimum)
     }
 }
 
@@ -133,10 +132,6 @@ impl<W: Write> Trimmer<W> {
         self.retained += 1;
         Ok(())
     }
-
-    fn finish(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
 }
 
 /// Trim reads by quality and position
@@ -174,6 +169,13 @@ struct Args {
     /// Drop reads shorter than this after trimming
     #[arg(short = 'l', long)]
     min_length: Option<usize>,
+
+    /// Report how many records were examined, trimmed, and dropped, on standard error
+    #[arg(long)]
+    report: bool,
+
+    #[command(flatten)]
+    parallelism: Parallelism,
 }
 
 fn main() {
@@ -187,16 +189,39 @@ fn main() {
         minimum_length: args.min_length,
     };
 
-    let result = (|| {
+    let report = args.report;
+
+    let result = (|| -> io::Result<()> {
         let rendering = Rendering::for_output(args.output.as_deref());
-        let output = open_output(args.output.as_deref())?;
-        let mut trimmer = Trimmer::new(output, settings, rendering);
-        map_reduce::for_each_record_at_paths(
+        let mut output = open_output(args.output.as_deref())?;
+        let mut workers = args.parallelism.ordered()?;
+        // Each state buffers the records of one byte range, and `retire` writes that buffer
+        // out in turn, so the output is the same bytes however many workers ran.
+        let mut states = workers.states(|| Trimmer::new(Vec::new(), settings, rendering));
+
+        for_each_record_in_inputs(
             &args.inputs,
-            &mut trimmer,
+            &mut workers,
+            &mut states,
             Trimmer::push,
+            |state| {
+                let buffered = state.writer.inner_mut();
+                output.write_all(buffered)?;
+                buffered.clear();
+                Ok(())
+            },
         )?;
-        trimmer.finish()
+        output.flush()?;
+
+        if report {
+            let examined: usize = states.iter().map(|state| state.examined).sum();
+            let retained: usize = states.iter().map(|state| state.retained).sum();
+            eprintln!(
+                "examined {examined} records, trimmed {retained}, dropped {} below the minimum length",
+                examined - retained
+            );
+        }
+        Ok(())
     })();
 
     finish_or_exit("Error trimming reads", result);
@@ -205,23 +230,17 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+    use fasterfasta::scheduling::for_each_record_in_bytes;
+
     fn trim(data: &[u8], settings: TrimSettings) -> String {
         let mut trimmer = Trimmer::new(Vec::new(), settings, Rendering::PLAIN);
-        map_reduce::for_each_record_in_bytes(
-            data,
-            &mut trimmer,
-            Trimmer::push).unwrap();
+        for_each_record_in_bytes(data, &mut trimmer, Trimmer::push).unwrap();
         String::from_utf8(trimmer.writer.into_inner()).unwrap()
     }
 
     fn trim_fasta(data: &[u8], settings: TrimSettings) -> io::Result<String> {
         let mut trimmer = Trimmer::new(Vec::new(), settings, Rendering::PLAIN);
-        map_reduce::for_each_record_in_bytes(
-            data,
-            &mut trimmer,
-            Trimmer::push,
-        )?;
+        for_each_record_in_bytes(data, &mut trimmer, Trimmer::push)?;
         Ok(String::from_utf8(trimmer.writer.into_inner()).unwrap())
     }
 
@@ -347,10 +366,7 @@ mod tests {
             ..Default::default()
         };
         let mut trimmer = Trimmer::new(Vec::new(), settings, Rendering::PLAIN);
-        map_reduce::for_each_record_in_bytes(
-            data,
-            &mut trimmer,
-            Trimmer::push).unwrap();
+        for_each_record_in_bytes(data, &mut trimmer, Trimmer::push).unwrap();
         assert_eq!(trimmer.examined, 2);
         assert_eq!(trimmer.retained, 1);
     }

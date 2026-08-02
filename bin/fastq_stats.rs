@@ -22,10 +22,9 @@ use std::io::{self, Write};
 
 use clap::Parser;
 
-use faster_fasta::{
-    finish_or_exit, map_file, open_output, phred33_sum, ForwardAccess, RandomAccess, Record,
-    SequenceFormat,
-};
+use fasterfasta::files::{finish_or_exit, open_output, InputFile};
+use fasterfasta::records::{phred33_sum, Record, SequenceFormat};
+use fasterfasta::scheduling::{for_each_record_in_input, Parallelism, Workers};
 
 /// Totals over a set of records.
 ///
@@ -178,8 +177,16 @@ fn write_header(output: &mut impl Write) -> io::Result<()> {
     writeln!(
         output,
         "{:<28} {:<7} {:>10} {:>14} {:>9} {:>11} {:>9} {:>8} {:>7} {:>7}",
-        "file", "format", "num_seqs", "sum_len", "min_len", "avg_len", "max_len", "mean_q",
-        "gc_pct", "n_pct"
+        "file",
+        "format",
+        "num_seqs",
+        "sum_len",
+        "min_len",
+        "avg_len",
+        "max_len",
+        "mean_q",
+        "gc_pct",
+        "n_pct"
     )
 }
 
@@ -205,17 +212,28 @@ fn write_row(output: &mut impl Write, label: &str, summary: &Summary) -> io::Res
 }
 
 /// Summarize one input, which may hold no records at all.
-fn summarize(path: &str) -> io::Result<Summary> {
+///
+/// Every column is associative and commutative, so the workers fold into one summary each and
+/// the merge at the end gives the answer a single pass would have.
+fn summarize(path: &str, workers: &mut Workers) -> io::Result<Summary> {
+    let mut states = workers.states(Summary::new);
+
+    let path = if path == "-" { None } else { Some(path) };
+    let mut input = InputFile::open(path)?;
+    for_each_record_in_input(
+        &mut input,
+        workers,
+        &mut states,
+        |state: &mut Summary, record: Record<'_>| {
+            state.add(&record);
+            Ok(())
+        },
+        |_| Ok(()),
+    )?;
+
     let mut summary = Summary::new();
-    let mut collect = |record: Record<'_>| {
-        summary.add(&record);
-        Ok(())
-    };
-    if path == "-" {
-        ForwardAccess::from_stdin().for_each_record(&mut collect)?;
-    } else {
-        let mapping = map_file(path)?;
-        RandomAccess::new(&mapping).for_each_record(&mut collect)?;
+    for state in &states {
+        summary.merge(state);
     }
     Ok(summary)
 }
@@ -243,6 +261,9 @@ struct Args {
     /// Show the length distribution across all inputs
     #[arg(long)]
     histogram: bool,
+
+    #[command(flatten)]
+    parallelism: Parallelism,
 }
 
 fn main() {
@@ -250,12 +271,17 @@ fn main() {
 
     let result = (|| -> io::Result<()> {
         let mut output = open_output(args.output.as_deref())?;
+        let mut workers = args.parallelism.unordered()?;
         let mut combined = Summary::new();
 
         write_header(&mut output)?;
         for path in &args.inputs {
-            let summary = summarize(path)?;
-            let label = if path == "-" { "(stdin)" } else { path.as_str() };
+            let summary = summarize(path, &mut workers)?;
+            let label = if path == "-" {
+                "(stdin)"
+            } else {
+                path.as_str()
+            };
             write_row(&mut output, label, &summary)?;
             combined.merge(&summary);
         }
@@ -275,12 +301,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faster_fasta::map_reduce;
+    use fasterfasta::scheduling;
 
     fn summary_of(data: &[u8], format: SequenceFormat) -> Summary {
         let mut summary = Summary::new();
         summary.format = Some(format);
-        map_reduce::for_each_record_in_bytes(data, &mut summary, |state: &mut Summary, record| {
+        scheduling::for_each_record_in_bytes(data, &mut summary, |state: &mut Summary, record| {
             state.add(&record);
             Ok(())
         })
@@ -327,7 +353,10 @@ mod tests {
     /// FASTA carries no quality, so reporting a mean of zero would look measured.
     #[test]
     fn fasta_reports_no_quality_rather_than_zero() {
-        assert_eq!(summary_of(b">a\nACGT\n", SequenceFormat::Fasta).mean_quality(), None);
+        assert_eq!(
+            summary_of(b">a\nACGT\n", SequenceFormat::Fasta).mean_quality(),
+            None
+        );
         let row = row_of(b">a\nACGT\n", SequenceFormat::Fasta);
         assert!(row.contains(" - "), "{row}");
     }
@@ -351,8 +380,7 @@ mod tests {
         );
     }
 
-    /// Uniform-length reads used to collapse into a single bar labelled with a range that
-    /// excluded them.
+    /// Reads that are all one length must land in a bar whose range actually contains them.
     #[test]
     fn uniform_lengths_are_reported_honestly() {
         let mut data = Vec::new();

@@ -1,5 +1,5 @@
 [package]
-name = "faster-fasta"
+name = "fasterfasta"
 version = "0.1.0"
 edition = "2021"
 authors = ["Ash Vardanian <1983160+ashvardanian@users.noreply.github.com>"]
@@ -10,23 +10,55 @@ keywords = ["bioinformatics", "fasta", "fastq", "cli", "sequence-analysis"]
 categories = ["command-line-utilities", "science"]
 repository = "https://github.com/ashvardanian/faster-fasta"
 
+[features]
+# The stream codecs are on by default because real datasets ship compressed and a toolkit
+# that cannot open them is a toolkit nobody reaches for. Each is one dependency, so a build
+# that wants none of them turns them off one at a time.
+default = ["gzip", "zstd", "bzip2", "xz", "lz4"]
+gzip = ["dep:flate2"]
+zstd = ["dep:zstd"]
+bzip2 = ["dep:bzip2"]
+xz = ["dep:lzma-rust2"]
+lz4 = ["dep:lz4_flex"]
+
 [dependencies]
+bzip2 = { version = "0.6", optional = true }
 clap = { version = "4.5", features = ["derive"] }
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"], optional = true }
+# StringZilla links the same worker pool with `use forkunion as _;`, which re-exports nothing,
+# so the scheduler has to name it directly. Cargo unifies the two into one build.
+forkunion = "3.0.2"
+lz4_flex = { version = "0.14", optional = true }
+lzma-rust2 = { version = "0.18", default-features = false, features = ["std", "xz", "encoder", "optimization"], optional = true }
 memmap2 = "0.9"
-stringzilla = "4.2.3"
+# Kept ahead of its first use: deduplication and sorting both need a tape of borrowed
+# spans over one payload, and StringZilla already pulls the same crate in.
+stringtape = { path = "../StringTape" }
+stringzilla = { version = "5", features = ["cpus"] }
+zstd = { version = "0.13", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"
+
+# Bound to the manifest rather than to a CI invocation, so a plain `cargo build` enforces the
+# same rules a reviewer would. `unwrap_used` stays allowed in tests, where a panic is the
+# assertion.
+# `missing_debug_implementations` is deliberately absent: the access types are generic over
+# their byte container, so deriving `Debug` would force a `B: Debug` bound on every one of
+# them to serve a trait nothing in this crate calls.
+[lints.rust]
+unreachable_pub = "warn"
+
+[lints.clippy]
+doc_markdown = "warn"
+needless_pass_by_value = "warn"
+uninlined_format_args = "warn"
 
 [profile.release]
 lto = true
 codegen-units = 1
 opt-level = 3
 strip = true
-
-[lib]
-name = "faster_fasta"
-path = "src/lib.rs"
 
 [[bin]]
 name = "fasta-dedup"

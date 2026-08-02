@@ -1,32 +1,33 @@
-//! Faster FASTA — the sequence-file layer every tool shares.
+//! Faster FASTA — what a record is, and the one parser that reads them.
 //!
-//! Four regions:
+//! Two regions:
 //!
 //! - __Records__ — what a record is, plus format detection and Phred conversions.
 //!   A record is always a borrow; nothing here owns per-record bytes.
 //! - __Parsing__ — one parser core returning [`ParseOutcome`], whose
 //!   [`ParseOutcome::Incomplete`] separates "the buffer ended mid-record" from "the input is
-//!   malformed". That single
-//!   distinction lets the same parser serve a whole memory map, a partially filled stream
-//!   window, and a byte range handed to one worker, which is why there is no second parser
-//!   anywhere in this crate.
-//! - __Containers__ — the three input shapes, and how records are read out of each.
-//! - __Output__ — record formatting and the boilerplate every `main` shares.
+//!   malformed".
+//!   That single distinction lets the same parser serve a whole memory map, a partially
+//!   filled stream window, and a byte range handed to one worker, which is why there is no
+//!   second parser anywhere in this crate.
 //!
-//! Scheduling lives in [`map_reduce`]. Nothing here spawns a thread or picks a shard.
+//! This is the lowest layer of the crate.
+//! Everything here is pure: no file is opened, no thread is spawned, no byte range is chosen,
+//! and no sibling module is declared.
+//! The shapes an input can arrive in live one level up, in [`crate::files`].
 
-pub mod map_reduce;
+use std::io;
 
-use std::io::{self, Read};
-
-use stringzilla::sz::{bytesum, find, find_byteset, hash_with_seed, Byteset};
+use stringzilla::sz::{bytesum, find, find_byteset, hash_with_seed, rfind, Byteset};
 
 // region: Records
 
 /// Which of the two sequence file formats a stream carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SequenceFormat {
+    /// Header and sequence, opened by `>`, with no per-base quality.
     Fasta,
+    /// Header, sequence, separator, and an equal-length quality line, opened by `@`.
     Fastq,
 }
 
@@ -113,14 +114,6 @@ impl RecordScratch {
         Self::default()
     }
 
-    /// Preallocates both buffers for records of up to `bytes` each.
-    pub fn with_capacity(bytes: usize) -> Self {
-        Self {
-            sequence: Vec::with_capacity(bytes),
-            quality: Vec::with_capacity(bytes),
-        }
-    }
-
     /// Retained sequence capacity, for tests asserting that reuse actually happens.
     pub fn sequence_capacity(&self) -> usize {
         self.sequence.capacity()
@@ -143,7 +136,7 @@ const WHITESPACE: Byteset = Byteset::from_bytes(b" \t\r\n");
 /// An input with nothing in it is empty, not malformed, so a filter that rejects every
 /// record still composes into the next tool in a pipeline. Only a first byte that opens
 /// neither format is an error.
-pub fn detect_format(data: &[u8]) -> io::Result<Option<SequenceFormat>> {
+pub fn sequence_format(data: &[u8]) -> io::Result<Option<SequenceFormat>> {
     for &byte in data.iter() {
         match byte {
             b' ' | b'\t' | b'\r' | b'\n' => continue,
@@ -152,8 +145,21 @@ pub fn detect_format(data: &[u8]) -> io::Result<Option<SequenceFormat>> {
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("unknown format: expected '@' or '>', found {:?}", byte as char),
-                ))
+                    match crate::codecs::Codec::detect(data) {
+                        crate::codecs::Codec::Plain => {
+                            format!(
+                                "unknown format: expected '@' or '>', found {:?}",
+                                byte as char
+                            )
+                        }
+                        // Only one container is peeled, deliberately: a second layer is far
+                        // more often a mistake than an intention.
+                        codec => format!(
+                            "input is compressed with {}, not FASTA or FASTQ",
+                            codec.name()
+                        ),
+                    },
+                ));
             }
         }
     }
@@ -199,7 +205,7 @@ pub enum RecordKey {
 ///
 /// Pure, so the same record yields the same digest whatever its position in the input, how
 /// the inputs were ordered, or how many workers ran. That is what lets sampling and
-/// deduplication shard without changing their answers.
+/// deduplication run wide without changing their answers.
 pub fn digest(record: &Record<'_>, key: RecordKey, seed: u64) -> u64 {
     let bytes = match key {
         RecordKey::Identifier => record.identifier(),
@@ -225,7 +231,10 @@ pub enum ParseOutcome<'a> {
 }
 
 fn invalid<'a>(message: &str) -> ParseOutcome<'a> {
-    ParseOutcome::Invalid(io::Error::new(io::ErrorKind::InvalidData, message.to_string()))
+    ParseOutcome::Invalid(io::Error::new(
+        io::ErrorKind::InvalidData,
+        message.to_string(),
+    ))
 }
 
 /// At end of input a partial record is a truncation, not a request for more bytes.
@@ -509,7 +518,14 @@ pub fn parse_leading_fastq_record<'a>(
 /// and are only safe to read from the start of the file.
 pub fn next_record_boundary(bytes: &[u8], from: usize, format: SequenceFormat) -> Option<usize> {
     let sigil = format.sigil();
-    if from == 0 && bytes.first() == Some(&sigil) {
+    // Offset zero earns the same proof as any other candidate. A window handed to one
+    // worker begins mid-record, so its first byte can be a quality '@' at Phred 31 as
+    // easily as a header's, and accepting it unproven would parse the previous worker's
+    // straddling record a second time.
+    if from == 0
+        && bytes.first() == Some(&sigil)
+        && (format == SequenceFormat::Fasta || fastq_cycle_holds(bytes, 0))
+    {
         return Some(0);
     }
 
@@ -519,7 +535,7 @@ pub fn next_record_boundary(bytes: &[u8], from: usize, format: SequenceFormat) -
     let needle = [b'\n', sigil];
     let mut cursor = from;
     loop {
-        let candidate = find(&bytes[cursor..], &needle)? + cursor + 1;
+        let candidate = find(&bytes[cursor..], needle)? + cursor + 1;
         if candidate >= bytes.len() {
             return None;
         }
@@ -536,7 +552,9 @@ fn fastq_cycle_holds(bytes: &[u8], candidate: usize) -> bool {
     let mut cursor = candidate;
     let mut lines = [0usize; 4];
     for slot in lines.iter_mut() {
-        let Some(end) = find_line_end(bytes, cursor) else { return false };
+        let Some(end) = find_line_end(bytes, cursor) else {
+            return false;
+        };
         *slot = length_without_carriage_return(&bytes[cursor..end]);
         cursor = end + 1;
     }
@@ -544,488 +562,38 @@ fn fastq_cycle_holds(bytes: &[u8], candidate: usize) -> bool {
     bytes.get(separator) == Some(&b'+') && lines[1] == lines[3]
 }
 
+/// Last record boundary in `bytes` that can be proven, for a driver that must end a slab
+/// where a record ends.
+///
+/// Demands the same full four-line proof of a FASTQ candidate as [`next_record_boundary`], so
+/// a boundary whose fourth line the slab cut off is refused and an earlier one reported. The
+/// bytes from the boundary on are a partial record the caller carries into the next slab.
+pub fn last_record_boundary(bytes: &[u8], format: SequenceFormat) -> Option<usize> {
+    let sigil = format.sigil();
+    let needle = [b'\n', sigil];
+    // Walking backwards one occurrence at a time, since the last `\n` before a sigil need not
+    // open a record: in FASTQ it is a quality line at Q31 until the cycle says otherwise.
+    let mut searched_back_to = bytes.len();
+    while let Some(found) = rfind(&bytes[..searched_back_to], needle) {
+        let candidate = found + 1;
+        if candidate < bytes.len()
+            && (format == SequenceFormat::Fasta || fastq_cycle_holds(bytes, candidate))
+        {
+            return Some(candidate);
+        }
+        // The window shrinks past the newline just examined, and a two-byte needle cannot
+        // match again at that position, so the walk always makes progress.
+        searched_back_to = found + 1;
+    }
+
+    // Offset zero earns the same proof as any other candidate, and is the only boundary a
+    // slab holding one record start can offer.
+    (bytes.first() == Some(&sigil)
+        && (format == SequenceFormat::Fasta || fastq_cycle_holds(bytes, 0)))
+    .then_some(0)
+}
+
 // endregion: Parsing
-
-// region: Containers
-
-/// A whole input held in memory or memory-mapped, addressable at any offset.
-///
-/// Byte-addressable inputs can be split into as many shards as there are workers, since
-/// [`next_record_boundary`] recovers a record boundary from any offset.
-pub struct RandomAccess<'a> {
-    data: &'a [u8],
-}
-
-/// A forward-only input: a pipe, a socket, or a decompressor over a plain gzip stream.
-///
-/// Nothing can be revisited and nothing can be split, so a stream is always exactly one
-/// shard, which the type states rather than leaving to a runtime check.
-pub struct ForwardAccess<R: Read> {
-    reader: R,
-    window: Vec<u8>,
-}
-
-/// Initial parse window for a [`ForwardAccess`], grown only when a single record does not fit.
-pub const DEFAULT_WINDOW_BYTES: usize = 1 << 20;
-
-impl<'a> RandomAccess<'a> {
-    /// Wraps a buffer that outlives every record read from it.
-    pub fn new(data: &'a [u8]) -> Self {
-        Self { data }
-    }
-
-    /// The underlying bytes, for a caller that needs offsets rather than records.
-    pub fn as_slice(&self) -> &'a [u8] {
-        self.data
-    }
-
-    /// Format of the first record, or `None` when there are no records.
-    pub fn detect_format(&self) -> io::Result<Option<SequenceFormat>> {
-        detect_format(self.data)
-    }
-
-    /// Visit every record in `range`, which must start at a record boundary.
-    ///
-    /// Records borrow either the input or a scratch buffer reused across the whole call, so
-    /// this allocates only while warming up.
-    pub fn for_each_record_in(
-        &self,
-        range: core::ops::Range<usize>,
-        mut visit: impl FnMut(Record<'_>) -> io::Result<()>,
-    ) -> io::Result<()> {
-        let mut scratch = RecordScratch::new();
-        let region = &self.data[range];
-        // A region with no records is empty, not malformed, so there is nothing to visit.
-        let Some(format) = detect_format(region)? else {
-            return Ok(());
-        };
-        let mut consumed = 0usize;
-
-        while consumed < region.len() {
-            match parse_leading_record(&region[consumed..], format, true, &mut scratch) {
-                ParseOutcome::Record(record, used) => {
-                    visit(record)?;
-                    debug_assert!(used > 0, "parser must make progress");
-                    consumed += used;
-                }
-                // At end of input this only happens on trailing whitespace.
-                ParseOutcome::Incomplete => break,
-                ParseOutcome::Invalid(error) => return Err(error),
-            }
-        }
-        Ok(())
-    }
-
-    /// Visit every record in the whole input.
-    pub fn for_each_record(
-        &self,
-        visit: impl FnMut(Record<'_>) -> io::Result<()>,
-    ) -> io::Result<()> {
-        self.for_each_record_in(0..self.data.len(), visit)
-    }
-}
-
-impl<R: Read> ForwardAccess<R> {
-    /// Wraps a reader with the default parse window.
-    pub fn new(reader: R) -> Self {
-        Self::with_window(reader, DEFAULT_WINDOW_BYTES)
-    }
-
-    /// Wraps a reader with an explicit window, which the tests use to force refills.
-    pub fn with_window(reader: R, window_bytes: usize) -> Self {
-        Self {
-            reader,
-            // Allocated once and reused for the life of the run.
-            window: vec![0u8; window_bytes.max(64)],
-        }
-    }
-
-    /// Visit every record, in bounded memory.
-    ///
-    /// The window is compacted at exactly one point, where the only live index is `consumed`
-    /// and it is reset in the same block, so no stale offset can survive a compaction.
-    pub fn for_each_record(
-        &mut self,
-        mut visit: impl FnMut(Record<'_>) -> io::Result<()>,
-    ) -> io::Result<()> {
-        let mut scratch = RecordScratch::new();
-        let mut filled = 0usize;
-        let mut consumed = 0usize;
-        let mut at_eof = false;
-
-        // The parser needs a format, so the first window supplies it. A stream with no
-        // records is empty, not malformed.
-        let format = loop {
-            match detect_format(&self.window[..filled])? {
-                Some(format) => break format,
-                None if at_eof => return Ok(()),
-                None => {
-                    if filled == self.window.len() {
-                        self.window.resize(self.window.len() * 2, 0);
-                    }
-                    let read_bytes = self.reader.read(&mut self.window[filled..])?;
-                    if read_bytes == 0 {
-                        at_eof = true;
-                    } else {
-                        filled += read_bytes;
-                    }
-                }
-            }
-        };
-
-        /// What the parse decided, carrying no borrow of the window.
-        enum Outcome {
-            Consumed(usize),
-            NeedMore,
-        }
-
-        loop {
-            let outcome = match parse_leading_record(&self.window[consumed..filled], format, at_eof, &mut scratch)
-            {
-                ParseOutcome::Record(record, used) => {
-                    visit(record)?;
-                    debug_assert!(used > 0, "parser must make progress");
-                    Outcome::Consumed(used)
-                }
-                ParseOutcome::Incomplete => Outcome::NeedMore,
-                ParseOutcome::Invalid(error) => return Err(error),
-            };
-            // The immutable borrow of `window` ends here, before any mutation below.
-
-            match outcome {
-                Outcome::Consumed(used) => {
-                    consumed += used;
-                    continue;
-                }
-                Outcome::NeedMore => {}
-            }
-
-            if at_eof {
-                // At end of input the parser reports `Incomplete` only for trailing
-                // whitespace; a genuine truncation comes back as `Invalid`.
-                break;
-            }
-
-            if consumed > 0 {
-                self.window.copy_within(consumed..filled, 0);
-                filled -= consumed;
-                consumed = 0;
-            }
-
-            if filled == self.window.len() {
-                // One record is larger than the whole window, so grow rather than stall.
-                self.window.resize(self.window.len() * 2, 0);
-            }
-
-            let read_bytes = self.reader.read(&mut self.window[filled..])?;
-            if read_bytes == 0 {
-                at_eof = true;
-            } else {
-                filled += read_bytes;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl ForwardAccess<Box<dyn Read>> {
-    /// A stream over standard input.
-    pub fn from_stdin() -> Self {
-        ForwardAccess::new(Box::new(io::stdin()))
-    }
-}
-
-/// Memory-map a file for byte-addressable access.
-pub fn map_file(path: &str) -> io::Result<memmap2::Mmap> {
-    let file = std::fs::File::open(path)?;
-    unsafe { memmap2::Mmap::map(&file) }
-}
-
-// endregion: Containers
-
-// region: Output
-
-/// How records are rendered, decided by whether the destination is a terminal.
-///
-/// A human reading a chromosome wants it wrapped and coloured; a file or pipe wants neither,
-/// so redirecting and piping produce identical bytes and nothing downstream meets an escape
-/// sequence. This is the convention `ls` follows, and the reason the default is detected
-/// rather than flagged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Rendering {
-    /// Columns per sequence line; `0` writes each sequence on one line.
-    pub line_width: usize,
-    /// Colour nucleotides by base.
-    pub color: bool,
-}
-
-impl Rendering {
-    /// Plain: one line per sequence, no colour. What a file or pipe receives.
-    pub const PLAIN: Self = Self {
-        line_width: 0,
-        color: false,
-    };
-
-    /// Wrapped at 60 columns and coloured. What a terminal receives.
-    pub const TERMINAL: Self = Self {
-        line_width: 60,
-        color: true,
-    };
-
-    /// [`Rendering::TERMINAL`] when `path` names standard output and that is a terminal,
-    /// [`Rendering::PLAIN`] otherwise.
-    pub fn for_output(path: Option<&str>) -> Self {
-        let to_stdout = matches!(path, None | Some("-"));
-        if to_stdout && std::io::IsTerminal::is_terminal(&io::stdout()) {
-            Self::TERMINAL
-        } else {
-            Self::PLAIN
-        }
-    }
-}
-
-/// Foreground colour for one nucleotide, or `None` to leave it uncoloured.
-fn base_color(base: u8) -> Option<&'static [u8]> {
-    match base.to_ascii_uppercase() {
-        b'A' => Some(b"\x1b[32m"),
-        b'C' => Some(b"\x1b[34m"),
-        b'G' => Some(b"\x1b[33m"),
-        b'T' | b'U' => Some(b"\x1b[31m"),
-        b'N' => Some(b"\x1b[90m"),
-        _ => None,
-    }
-}
-
-/// Append `sequence`, wrapped per `rendering`, followed by a line terminator.
-///
-/// Split by case so the plain form — what every file and pipe receives — is one copy per
-/// line rather than a decision per byte.
-fn sequence_into(target: &mut Vec<u8>, sequence: &[u8], rendering: Rendering) {
-    match (rendering.line_width, rendering.color) {
-        (0, false) => target.extend_from_slice(sequence),
-        (width, false) => {
-            for line in sequence.chunks(width) {
-                target.extend_from_slice(line);
-                target.push(b'\n');
-            }
-            return;
-        }
-        (width, true) => {
-            colored_sequence_into(target, sequence, width);
-            return;
-        }
-    }
-    target.push(b'\n');
-}
-
-/// Append `sequence` wrapped at `width` and coloured by base.
-///
-/// Reached only when the destination is a terminal, so its cost never falls on a pipe.
-/// Colour is emitted per run rather than per byte, so a homopolymer costs one escape.
-fn colored_sequence_into(target: &mut Vec<u8>, sequence: &[u8], width: usize) {
-    const RESET: &[u8] = b"\x1b[0m";
-    let width = if width == 0 { usize::MAX } else { width };
-
-    for line in sequence.chunks(width) {
-        let mut active: Option<&'static [u8]> = None;
-        for &base in line {
-            let wanted = base_color(base);
-            if wanted != active {
-                if active.is_some() {
-                    target.extend_from_slice(RESET);
-                }
-                if let Some(escape) = wanted {
-                    target.extend_from_slice(escape);
-                }
-                active = wanted;
-            }
-            target.push(base);
-        }
-        if active.is_some() {
-            target.extend_from_slice(RESET);
-        }
-        target.push(b'\n');
-    }
-}
-
-/// Append one formatted record to `target`. Quality is emitted only for FASTQ output.
-fn format_into(
-    target: &mut Vec<u8>,
-    format: SequenceFormat,
-    rendering: Rendering,
-    header_body: &[u8],
-    sequence: &[u8],
-    quality: &[u8],
-) {
-    if rendering.color {
-        target.extend_from_slice(b"\x1b[1;36m");
-    }
-    target.push(format.sigil());
-    target.extend_from_slice(header_body);
-    if rendering.color {
-        target.extend_from_slice(b"\x1b[0m");
-    }
-    target.push(b'\n');
-
-    sequence_into(target, sequence, rendering);
-
-    if format == SequenceFormat::Fastq {
-        target.extend_from_slice(b"+\n");
-        // Quality wraps with the sequence so the two stay line-aligned, and is never
-        // coloured, since its bytes are scores rather than bases.
-        sequence_into(
-            target,
-            quality,
-            Rendering {
-                color: false,
-                ..rendering
-            },
-        );
-    }
-}
-
-/// bytes. Staging into one reusable buffer makes it one call, and costs one allocation
-/// for the whole run.
-pub struct RecordWriter<W: io::Write> {
-    writer: W,
-    staging: Vec<u8>,
-    format: SequenceFormat,
-    /// Format settled by [`RecordWriter::adopt`], so a later disagreement is caught.
-    adopted: Option<SequenceFormat>,
-    rendering: Rendering,
-}
-
-impl<W: io::Write> RecordWriter<W> {
-    /// Wraps a writer, emitting plain records in `format` until told otherwise.
-    pub fn new(writer: W, format: SequenceFormat) -> Self {
-        Self {
-            writer,
-            staging: Vec::with_capacity(4 << 10),
-            format,
-            adopted: None,
-            rendering: Rendering::PLAIN,
-        }
-    }
-
-    /// Wraps a writer that renders per `rendering`.
-    pub fn with_rendering(writer: W, rendering: Rendering, format: SequenceFormat) -> Self {
-        Self {
-            rendering,
-            ..Self::new(writer, format)
-        }
-    }
-
-    /// Output format, which need not match the input's — this is all of `fastq-to-fasta`.
-    pub fn format(&self) -> SequenceFormat {
-        self.format
-    }
-
-    /// Choose the output format after construction.
-    pub fn set_format(&mut self, format: SequenceFormat) {
-        self.format = format;
-    }
-
-    /// Mirror `format` onto the output, settling on the first record's and refusing a later
-    /// change, since one stream cannot carry both.
-    ///
-    /// Idempotent, so a tool can call it per record instead of needing a hook that fires
-    /// before the records do.
-    pub fn adopt(&mut self, format: SequenceFormat) -> io::Result<()> {
-        match self.adopted {
-            Some(first) if first != format => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("input is {format:?} but an earlier record was {first:?}; one output stream cannot carry both"),
-            )),
-            Some(_) => Ok(()),
-            None => {
-                self.adopted = Some(format);
-                self.format = format;
-                Ok(())
-            }
-        }
-    }
-
-    /// Write `record` verbatim, re-sigiling the header to the output format.
-    pub fn write_record(&mut self, record: Record<'_>) -> io::Result<()> {
-        self.write_parts(record.header_without_sigil(), record.sequence, record.quality)
-    }
-
-    /// Write a record from parts, where `header_body` excludes the sigil.
-    ///
-    /// Quality is emitted only for FASTQ output, and a FASTA source converted to FASTQ
-    /// would have none — callers wanting that must supply it.
-    pub fn write_parts(
-        &mut self,
-        header_body: &[u8],
-        sequence: &[u8],
-        quality: &[u8],
-    ) -> io::Result<()> {
-        self.staging.clear();
-        format_into(
-            &mut self.staging,
-            self.format,
-            self.rendering,
-            header_body,
-            sequence,
-            quality,
-        );
-        self.writer.write_all(&self.staging)
-    }
-
-    /// Format a record into `target`, replacing its contents and keeping its capacity.
-    ///
-    /// For a tool that must retain records: a record borrows the input, so surviving past
-    /// the next one means owning the bytes.
-    pub fn render_into(&self, record: Record<'_>, target: &mut Vec<u8>) {
-        target.clear();
-        format_into(
-            target,
-            self.format,
-            self.rendering,
-            record.header_without_sigil(),
-            record.sequence,
-            record.quality,
-        );
-    }
-
-    /// Write bytes produced by [`RecordWriter::render_into`], which are already formatted.
-    pub fn write_rendered(&mut self, rendered: &[u8]) -> io::Result<()> {
-        self.writer.write_all(rendered)
-    }
-
-    /// Flushes the underlying writer; the staging buffer never holds a partial record.
-    pub fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
-    }
-
-    /// Consumes the writer, which the tests use to recover a `Vec<u8>` sink.
-    pub fn into_inner(self) -> W {
-        self.writer
-    }
-}
-
-/// Writer for `path`, or standard output when it is `None` or `"-"`.
-pub fn open_output(path: Option<&str>) -> io::Result<Box<dyn io::Write>> {
-    match path {
-        None | Some("-") => Ok(Box::new(io::BufWriter::new(io::stdout()))),
-        Some(path) => Ok(Box::new(io::BufWriter::new(std::fs::File::create(path)?))),
-    }
-}
-
-/// The epilogue every tool's `main` shares: a broken pipe is a normal end, because
-/// `tool | head` is a routine way to use these; anything else is fatal.
-pub fn finish_or_exit(context: &str, result: io::Result<()>) {
-    if let Err(error) = result {
-        if error.kind() == io::ErrorKind::BrokenPipe {
-            std::process::exit(0);
-        }
-        eprintln!("{context}: {error}");
-        std::process::exit(1);
-    }
-}
-
-
-// endregion: Output
 
 #[cfg(test)]
 mod tests {
@@ -1034,11 +602,11 @@ mod tests {
     #[test]
     fn detects_both_formats() {
         assert_eq!(
-            detect_format(b">seq1\nACGT\n").unwrap(),
+            sequence_format(b">seq1\nACGT\n").unwrap(),
             Some(SequenceFormat::Fasta)
         );
         assert_eq!(
-            detect_format(b"@seq1\nACGT\n+\nIIII\n").unwrap(),
+            sequence_format(b"@seq1\nACGT\n+\nIIII\n").unwrap(),
             Some(SequenceFormat::Fastq)
         );
     }
@@ -1046,7 +614,7 @@ mod tests {
     #[test]
     fn detects_past_leading_whitespace() {
         assert_eq!(
-            detect_format(b"  \n  >seq1\nACGT\n").unwrap(),
+            sequence_format(b"  \n  >seq1\nACGT\n").unwrap(),
             Some(SequenceFormat::Fasta)
         );
     }
@@ -1054,7 +622,7 @@ mod tests {
     #[test]
     fn rejects_an_unknown_first_byte() {
         assert_eq!(
-            detect_format(b"ACGT\n").unwrap_err().kind(),
+            sequence_format(b"ACGT\n").unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
     }
@@ -1063,8 +631,8 @@ mod tests {
     /// everything still composes into the next tool in a pipeline.
     #[test]
     fn empty_input_has_no_format_and_is_not_an_error() {
-        assert_eq!(detect_format(b"").unwrap(), None);
-        assert_eq!(detect_format(b"   \n").unwrap(), None);
+        assert_eq!(sequence_format(b"").unwrap(), None);
+        assert_eq!(sequence_format(b"   \n").unwrap(), None);
     }
 
     #[test]
@@ -1074,7 +642,10 @@ mod tests {
             sequence: b"ACGT",
             quality: b"",
         };
-        assert_eq!(record.header_without_sigil(), b"sp|P12345| some description here");
+        assert_eq!(
+            record.header_without_sigil(),
+            b"sp|P12345| some description here"
+        );
         assert_eq!(record.identifier(), b"sp|P12345|");
     }
 
@@ -1104,11 +675,11 @@ mod tests {
         assert_eq!(mean_quality(b""), 0.0);
     }
 
+    /// Header, sequence, and quality of every record one parse pass produced.
+    type ParsedRecords = Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>;
+
     /// Parses to exhaustion over a complete slice.
-    fn parse_all(
-        data: &[u8],
-        format: SequenceFormat,
-    ) -> io::Result<Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>> {
+    fn parse_all(data: &[u8], format: SequenceFormat) -> io::Result<ParsedRecords> {
         let mut scratch = RecordScratch::new();
         let mut out = Vec::new();
         let mut cursor = 0;
@@ -1151,7 +722,8 @@ mod tests {
 
     #[test]
     fn fasta_multiline_is_joined() {
-        let records = parse_all(b">seq1\nACGT\nTGCA\n>seq2\nAAAA\n", SequenceFormat::Fasta).unwrap();
+        let records =
+            parse_all(b">seq1\nACGT\nTGCA\n>seq2\nAAAA\n", SequenceFormat::Fasta).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].1, b"ACGTTGCA");
         assert_eq!(records[1].1, b"AAAA");
@@ -1238,7 +810,9 @@ mod tests {
         for length in 1..data.len() {
             match parse_leading_fastq_record(&data[..length], false, &mut scratch) {
                 ParseOutcome::Incomplete => {}
-                ParseOutcome::Record(..) => panic!("prefix of {length} bytes parsed as a full record"),
+                ParseOutcome::Record(..) => {
+                    panic!("prefix of {length} bytes parsed as a full record")
+                }
                 ParseOutcome::Invalid(error) => {
                     panic!("prefix of {length} bytes reported as invalid: {error}")
                 }
@@ -1280,195 +854,65 @@ mod tests {
         );
     }
 
-    /// Re-emits every record verbatim, so a driver run can be compared byte for byte
-    /// against another driver run over the same input.
-    #[derive(Debug, Default)]
-    struct Collector {
-        output: Vec<u8>,
-        records: usize,
-        finished: bool,
-    }
-
-    impl Collector {
-        fn push(&mut self, record: Record<'_>) -> io::Result<()> {
-            self.output.extend_from_slice(record.header);
-            self.output.push(b'\n');
-            self.output.extend_from_slice(record.sequence);
-            self.output.push(b'\n');
-            if !record.quality.is_empty() {
-                self.output.extend_from_slice(b"+\n");
-                self.output.extend_from_slice(record.quality);
-                self.output.push(b'\n');
-            }
-            self.records += 1;
-            Ok(())
-        }
-
-        fn finish(&mut self) -> io::Result<()> {
-            self.finished = true;
-            Ok(())
-        }
-    }
-
-    /// Returns at most `limit` bytes per call, the way a pipe or socket does. `Cursor`
-    /// always satisfies the full request and so can never drive the window through a
-    /// mid-record refill.
-    struct ShortReader<R: Read> {
-        inner: R,
-        limit: usize,
-    }
-
-    impl<R: Read> Read for ShortReader<R> {
-        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-            let capped = out.len().min(self.limit);
-            self.inner.read(&mut out[..capped])
-        }
-    }
-
-    fn sample_fastq(records: usize) -> Vec<u8> {
-        let mut data = Vec::new();
-        for index in 0..records {
-            let width = 8 + (index % 7) * 3;
-            let base = [b'A', b'C', b'G', b'T'][index % 4];
-            data.extend_from_slice(format!("@read{index} sample record\n").as_bytes());
-            data.extend(std::iter::repeat(base).take(width));
-            data.extend_from_slice(b"\n+\n");
-            data.extend(std::iter::repeat(b'I').take(width));
-            data.push(b'\n');
-        }
-        data
-    }
-
-    fn sample_fasta(records: usize) -> Vec<u8> {
-        let mut data = Vec::new();
-        for index in 0..records {
-            let width = 9 + (index % 5) * 4;
-            let base = [b'A', b'C', b'G', b'T'][index % 4];
-            data.extend_from_slice(format!(">contig{index} sample record\n").as_bytes());
-            // Wrapped at 6 columns, so most records exercise the scratch path.
-            for chunk_start in (0..width).step_by(6) {
-                let chunk = (width - chunk_start).min(6);
-                data.extend(std::iter::repeat(base).take(chunk));
-                data.push(b'\n');
-            }
-        }
-        data
-    }
-
-    fn drive_bytes(data: &[u8], format: SequenceFormat) -> io::Result<Collector> {
-        let mut sink = Collector::default();
-        RandomAccess::new(data).for_each_record(|record| sink.push(record))?;
-        sink.finish()?;
-        Ok(sink)
-    }
-
-    fn drive_stream(
-        data: &[u8],
-        format: SequenceFormat,
-        limit: usize,
-        window: usize,
-    ) -> io::Result<Collector> {
-        let mut sink = Collector::default();
-        let reader = ShortReader {
-            inner: io::Cursor::new(data),
-            limit,
-        };
-        ForwardAccess::with_window(reader, window)
-            .for_each_record(|record| sink.push(record))?;
-        sink.finish()?;
-        Ok(sink)
-    }
-
-    /// The property the whole design rests on: however the bytes arrive, the records come
-    /// out identical.
+    /// A FASTQ quality line may open with '@', so a naive boundary search lands mid-record.
     #[test]
-    fn stream_matches_slice_for_fastq() {
-        let data = sample_fastq(40);
-        let expected = drive_bytes(&data, SequenceFormat::Fastq).unwrap();
-        assert_eq!(expected.records, 40);
-
-        for limit in [1, 3, 7, 13, 64, 4096] {
-            for window in [64, 128, 1024, DEFAULT_WINDOW_BYTES] {
-                let actual = drive_stream(&data, SequenceFormat::Fastq, limit, window)
-                    .unwrap_or_else(|error| panic!("limit {limit}, window {window}: {error}"));
-                assert_eq!(
-                    actual.output, expected.output,
-                    "limit {limit}, window {window}: output diverged"
-                );
-                assert_eq!(actual.records, expected.records);
-            }
-        }
+    fn next_record_boundary_rejects_fastq_quality_opening_with_at() {
+        // Quality '@' is Phred 31, entirely legal, and here it opens the fourth line.
+        let data = b"@read0\nACGT\n+\n@III\n@read1\nTGCA\n+\nIIII\n".to_vec();
+        let boundary = next_record_boundary(&data, 1, SequenceFormat::Fastq).unwrap();
+        assert_eq!(&data[boundary..boundary + 6], b"@read1");
     }
 
     #[test]
-    fn stream_matches_slice_for_fasta() {
-        let data = sample_fasta(30);
-        let expected = drive_bytes(&data, SequenceFormat::Fasta).unwrap();
-        assert_eq!(expected.records, 30);
-
-        for limit in [1, 5, 11, 64, 4096] {
-            for window in [64, 256, DEFAULT_WINDOW_BYTES] {
-                let actual = drive_stream(&data, SequenceFormat::Fasta, limit, window)
-                    .unwrap_or_else(|error| panic!("limit {limit}, window {window}: {error}"));
-                assert_eq!(
-                    actual.output, expected.output,
-                    "limit {limit}, window {window}: output diverged"
-                );
-            }
-        }
-    }
-
-    /// A record larger than the initial window must grow it, not stall or truncate.
-    #[test]
-    fn record_larger_than_window_grows_it() {
-        let mut data = Vec::from(&b"@long\n"[..]);
-        data.extend(std::iter::repeat(b'A').take(5000));
-        data.extend_from_slice(b"\n+\n");
-        data.extend(std::iter::repeat(b'I').take(5000));
-        data.push(b'\n');
-
-        let sink = drive_stream(&data, SequenceFormat::Fastq, 17, 64).unwrap();
-        assert_eq!(sink.records, 1);
-        assert!(sink.output.windows(5000).any(|w| w.iter().all(|&b| b == b'A')));
+    fn next_record_boundary_finds_the_next_fasta_record() {
+        let data = b">a\nACGT\n>b\nTGCA\n";
+        assert_eq!(
+            next_record_boundary(data, 0, SequenceFormat::Fasta),
+            Some(0)
+        );
+        assert_eq!(
+            next_record_boundary(data, 1, SequenceFormat::Fasta),
+            Some(8)
+        );
     }
 
     #[test]
-    fn truncated_input_is_an_error() {
-        // Quality is one byte short of the sequence and the stream ends.
-        let data = b"@seq1\nACGT\n+\nIII";
-        let result = drive_stream(data, SequenceFormat::Fastq, 4, 64);
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    fn next_record_boundary_returns_none_past_the_end() {
+        let data = b">a\nACGT\n";
+        assert_eq!(next_record_boundary(data, 3, SequenceFormat::Fasta), None);
     }
 
     #[test]
-    fn empty_input_yields_no_records() {
-        let sink = drive_stream(b"", SequenceFormat::Fastq, 8, 64).unwrap();
-        assert_eq!(sink.records, 0);
-        assert!(sink.finished);
+    fn last_record_boundary_finds_the_final_fasta_record() {
+        let data = b">a\nACGT\n>b\nTGCA\n>c\nGGGG\n";
+        let boundary = last_record_boundary(data, SequenceFormat::Fasta).unwrap();
+        assert_eq!(&data[boundary..boundary + 2], b">c");
+    }
+
+    /// A slab ends mid-record, so the last boundary is the one before the cut rather than the
+    /// candidate whose fourth line the slab never held.
+    #[test]
+    fn last_record_boundary_refuses_a_cycle_the_slab_cut_off() {
+        let data = b"@read0\nACGT\n+\nIIII\n@read1\nTGCA\n+\nII";
+        let boundary = last_record_boundary(data, SequenceFormat::Fastq).unwrap();
+        assert_eq!(boundary, 0);
+    }
+
+    /// Quality '@' at Phred 31 opens a line here, and only the four-line proof tells it apart
+    /// from a header.
+    #[test]
+    fn last_record_boundary_rejects_fastq_quality_opening_with_at() {
+        let data = b"@read0\nACGT\n+\nIIII\n@read1\nTGCA\n+\n@III\n";
+        let boundary = last_record_boundary(data, SequenceFormat::Fastq).unwrap();
+        assert_eq!(&data[boundary..boundary + 6], b"@read1");
     }
 
     #[test]
-    fn trailing_whitespace_is_not_an_error() {
-        let data = b"@seq1\nACGT\n+\nIIII\n\n\n  \n";
-        let sink = drive_stream(data, SequenceFormat::Fastq, 3, 64).unwrap();
-        assert_eq!(sink.records, 1);
-    }
-
-    #[test]
-    fn finish_runs_even_with_no_records() {
-        let mut sink = Collector::default();
-        RandomAccess::new(b"")
-            .for_each_record(|record| sink.push(record))
-            .unwrap();
-        sink.finish().unwrap();
-        assert!(sink.finished);
-    }
-
-    #[test]
-    fn format_detection_feeds_the_driver() {
-        let data = sample_fasta(3);
-        let format = detect_format(&data).unwrap().unwrap();
-        assert_eq!(format, SequenceFormat::Fasta);
-        assert_eq!(drive_bytes(&data, format).unwrap().records, 3);
+    fn last_record_boundary_finds_nothing_in_bytes_that_open_no_record() {
+        assert_eq!(
+            last_record_boundary(b"ACGT\nACGT\n", SequenceFormat::Fasta),
+            None
+        );
+        assert_eq!(last_record_boundary(b"", SequenceFormat::Fastq), None);
     }
 }

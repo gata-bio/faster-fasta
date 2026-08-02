@@ -18,7 +18,7 @@ use std::io::{self, Write};
 use clap::Parser;
 
 use fasterfasta::files::{finish_or_exit, open_output, RecordWriter, Rendering};
-use fasterfasta::records::{mean_quality, Record, SequenceFormat};
+use fasterfasta::records::{mean_quality, needs_fastq, Record, SequenceFormat};
 use fasterfasta::scheduling::{for_each_record_in_inputs, Parallelism};
 
 /// Every criterion is optional; a `None` never rejects anything.
@@ -33,30 +33,36 @@ struct Criteria {
 impl Criteria {
     /// Bounds that exclude each other would silently drop every record.
     fn validate(&self) -> io::Result<()> {
-        if let Some(fraction) = self.maximum_n_fraction {
-            if !(0.0..=1.0).contains(&fraction) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("--max-n-fraction must be between 0.0 and 1.0, got {fraction}"),
-                ));
-            }
+        let outside_unit_range = self
+            .maximum_n_fraction
+            .filter(|fraction| !(0.0..=1.0).contains(fraction));
+        if let Some(fraction) = outside_unit_range {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--max-n-fraction must be between 0.0 and 1.0, got {fraction}"),
+            ));
         }
-        if let (Some(minimum), Some(maximum)) = (self.minimum_length, self.maximum_length) {
-            if minimum > maximum {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("--min-length {minimum} exceeds --max-length {maximum}, so no record can pass"),
-                ));
-            }
+        let contradictory = self
+            .minimum_length
+            .zip(self.maximum_length)
+            .filter(|(minimum, maximum)| minimum > maximum);
+        if let Some((minimum, maximum)) = contradictory {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "--min-length {minimum} exceeds --max-length {maximum}, so no record can pass"
+                ),
+            ));
         }
         Ok(())
     }
 
     fn accepts(&self, record: &Record<'_>) -> bool {
-        if let Some(threshold) = self.minimum_quality {
-            if mean_quality(record.quality) < threshold {
-                return false;
-            }
+        if self
+            .minimum_quality
+            .is_some_and(|threshold| mean_quality(record.quality) < threshold)
+        {
+            return false;
         }
 
         let length = record.sequence.len();
@@ -67,18 +73,17 @@ impl Criteria {
             return false;
         }
 
-        if let Some(maximum) = self.maximum_n_fraction {
-            // An empty sequence has no ambiguous bases, so it cannot exceed any bound.
-            if length > 0 {
-                let ambiguous = record
-                    .sequence
-                    .iter()
-                    .filter(|&&base| base == b'N' || base == b'n')
-                    .count();
-                if ambiguous as f32 / length as f32 > maximum {
-                    return false;
-                }
-            }
+        // The divisor is floored at one, so an empty sequence divides no ambiguous bases by
+        // one and clears every bound rather than dividing by zero.
+        if self.maximum_n_fraction.is_some_and(|maximum| {
+            let ambiguous = record
+                .sequence
+                .iter()
+                .filter(|&&base| base == b'N' || base == b'n')
+                .count();
+            ambiguous as f32 / length.max(1) as f32 > maximum
+        }) {
+            return false;
         }
 
         true
@@ -103,11 +108,8 @@ impl<W: Write> Filter<W> {
     }
 
     fn push(&mut self, record: Record<'_>) -> io::Result<()> {
-        if record.format() == SequenceFormat::Fasta && self.criteria.minimum_quality.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "--min-quality needs FASTQ input, but this input is FASTA",
-            ));
+        if self.criteria.minimum_quality.is_some() {
+            needs_fastq("--min-quality", record.format())?;
         }
         self.writer.adopt(record.format())?;
         self.examined += 1;
@@ -160,54 +162,45 @@ struct Args {
     parallelism: Parallelism,
 }
 
-fn main() {
-    let args = Args::parse();
-
+fn run(args: &Args) -> io::Result<()> {
     let criteria = Criteria {
         minimum_quality: args.min_quality,
         minimum_length: args.min_length,
         maximum_length: args.max_length,
         maximum_n_fraction: args.max_n_fraction,
     };
+    // Config is checked before any input is opened, so a contradiction fails at once.
+    criteria.validate()?;
 
-    let report = args.report;
+    let rendering = Rendering::for_output(args.output.as_deref());
+    let mut output = open_output(args.output.as_deref())?;
+    let mut workers = args.parallelism.ordered()?;
+    // Each state buffers the records of one unit of work, and `retire` writes that buffer
+    // out in turn, so the output is the same bytes however many workers ran.
+    let mut states = workers.states(|| Filter::new(Vec::new(), criteria, rendering));
 
-    let result = (|| -> io::Result<()> {
-        // Config is checked before any input is opened, so a contradiction fails at once.
-        criteria.validate()?;
-        let rendering = Rendering::for_output(args.output.as_deref());
-        let mut output = open_output(args.output.as_deref())?;
-        let mut workers = args.parallelism.ordered()?;
-        // Each state buffers the records of one byte range, and `retire` writes that buffer
-        // out in turn, so the output is the same bytes however many workers ran.
-        let mut states = workers.states(|| Filter::new(Vec::new(), criteria, rendering));
+    for_each_record_in_inputs(
+        &args.inputs,
+        &mut workers,
+        &mut states,
+        Filter::push,
+        |state| state.writer.drain_into(&mut output),
+    )?;
+    output.flush()?;
 
-        for_each_record_in_inputs(
-            &args.inputs,
-            &mut workers,
-            &mut states,
-            Filter::push,
-            |state| {
-                let buffered = state.writer.inner_mut();
-                output.write_all(buffered)?;
-                buffered.clear();
-                Ok(())
-            },
-        )?;
-        output.flush()?;
+    if args.report {
+        let examined: usize = states.iter().map(|state| state.examined).sum();
+        let retained: usize = states.iter().map(|state| state.retained).sum();
+        eprintln!(
+            "examined {examined} records, retained {retained}, dropped {}",
+            examined - retained
+        );
+    }
+    Ok(())
+}
 
-        if report {
-            let examined: usize = states.iter().map(|state| state.examined).sum();
-            let retained: usize = states.iter().map(|state| state.retained).sum();
-            eprintln!(
-                "examined {examined} records, retained {retained}, dropped {}",
-                examined - retained
-            );
-        }
-        Ok(())
-    })();
-
-    finish_or_exit("Error filtering records", result);
+fn main() {
+    finish_or_exit("Error filtering records", run(&Args::parse()));
 }
 
 #[cfg(test)]

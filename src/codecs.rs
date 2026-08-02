@@ -420,23 +420,12 @@ mod tests {
     /// Sniffing must reconstruct the source exactly, however the bytes arrive.
     #[test]
     fn peeked_bytes_are_replayed_in_full() {
-        struct ShortReader<R: Read> {
-            inner: R,
-            limit: usize,
-        }
-        impl<R: Read> Read for ShortReader<R> {
-            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-                let capped = out.len().min(self.limit);
-                self.inner.read(&mut out[..capped])
-            }
-        }
-
         let source: Vec<u8> = (0..500u32).map(|value| value as u8).collect();
         for limit in [1, 3, 7, 64, 4096] {
-            let mut reader = PeekedReader::sniffing(ShortReader {
-                inner: io::Cursor::new(source.clone()),
+            let mut reader = PeekedReader::sniffing(crate::fixtures::ShortReader::new(
+                io::Cursor::new(source.clone()),
                 limit,
-            })
+            ))
             .unwrap();
             let mut replayed = Vec::new();
             reader.read_to_end(&mut replayed).unwrap();

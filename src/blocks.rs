@@ -37,17 +37,16 @@ pub trait BlockAccess: Sync {
 
     /// Decoded bytes in one block, as far as the container states them.
     ///
-    /// Decoded rather than compressed because poly-A compresses ten to one against ordinary
-    /// sequence, so budgeting on compressed bytes hands one worker ten times the work.
-    ///
     /// # Panics
     ///
     /// When `index` is at or past [`BlockAccess::block_count`]. A block that is not in the
     /// table has no size to report, and a caller that asks for one has counted wrong.
     fn bytes_in_block(&self, index: usize) -> BlockBytes;
 
-    /// A decode scratch for one worker, separate from `&self` because the container is shared
-    /// and the decoder is not.
+    /// Decoder state for one worker, separate from `&self` because the container is shared and
+    /// the decoder is not.
+    ///
+    /// One per worker rather than one per block, so a run of blocks pays for the state once.
     fn decoder(&self) -> Box<dyn BlockDecoder + '_>;
 
     /// A forward reader over `from_block` and every block after it.
@@ -60,13 +59,48 @@ pub trait BlockAccess: Sync {
         Box::new(BlockRunReader {
             blocks: from_block..self.block_count(),
             decoder: self.decoder(),
-            decoded: Vec::new(),
-            handed_out: 0,
+            decoded: DecodedBlock::default(),
         })
     }
 }
 
+/// One decoded block and how much of it a reader has handed out.
+///
+/// Both readers here decode one block at a time and copy a prefix of it out, differing only in
+/// how they locate the next block, so the arithmetic that hands out that prefix lives once.
+#[derive(Default)]
+struct DecodedBlock {
+    bytes: Vec<u8>,
+    handed_out: usize,
+}
+
+impl DecodedBlock {
+    /// Whether every decoded byte has been handed out, so the next block has to be located.
+    fn is_drained(&self) -> bool {
+        self.handed_out == self.bytes.len()
+    }
+
+    /// Replace the decoded bytes through `decode`, then rewind, so a decode that fails leaves
+    /// the block exactly as it stood.
+    fn refill<T>(&mut self, decode: impl FnOnce(&mut Vec<u8>) -> io::Result<T>) -> io::Result<T> {
+        let decoded = decode(&mut self.bytes)?;
+        self.handed_out = 0;
+        Ok(decoded)
+    }
+
+    /// Copy as much as `out` holds out of what is left, and report how much that was.
+    fn hand_out(&mut self, out: &mut [u8]) -> usize {
+        let take = out.len().min(self.bytes.len() - self.handed_out);
+        out[..take].copy_from_slice(&self.bytes[self.handed_out..self.handed_out + take]);
+        self.handed_out += take;
+        take
+    }
+}
+
 /// What a container knows about a block's decoded size before decoding it.
+///
+/// Decoded rather than compressed because poly-A compresses ten to one against ordinary
+/// sequence, so budgeting on compressed bytes hands one worker ten times the work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockBytes {
     /// The container declares it: a BGZF trailer, an xz index record, an lz4 stored block.
@@ -110,8 +144,7 @@ pub trait BlockDecoder {
 struct BlockRunReader<'a> {
     blocks: core::ops::Range<usize>,
     decoder: Box<dyn BlockDecoder + 'a>,
-    decoded: Vec<u8>,
-    handed_out: usize,
+    decoded: DecodedBlock,
 }
 
 impl Read for BlockRunReader<'_> {
@@ -119,17 +152,15 @@ impl Read for BlockRunReader<'_> {
         // An empty block — a BGZF end-of-file marker, or a flush of an empty buffer — decodes
         // to nothing, and handing back zero would read as end of stream, so keep decoding
         // until there is something to give.
-        while self.handed_out == self.decoded.len() {
+        while self.decoded.is_drained() {
             let Some(index) = self.blocks.next() else {
                 return Ok(0);
             };
-            self.decoder.decode_into(index, &mut self.decoded)?;
-            self.handed_out = 0;
+            let decoder = &mut self.decoder;
+            self.decoded
+                .refill(|bytes| decoder.decode_into(index, bytes))?;
         }
-        let take = out.len().min(self.decoded.len() - self.handed_out);
-        out[..take].copy_from_slice(&self.decoded[self.handed_out..self.handed_out + take]);
-        self.handed_out += take;
-        Ok(take)
+        Ok(self.decoded.hand_out(out))
     }
 }
 
@@ -140,7 +171,7 @@ impl Read for BlockRunReader<'_> {
 /// that settles it for BGZF and lz4, while a plain xz stream and a blocked one share every byte
 /// of their magic and only the footer index tells them apart. Three inputs come back as the
 /// bytes they went in as and read as streams: a single-block xz file, an lz4 frame whose blocks
-/// depend on the window before them, and any container with no block layout at all.
+/// depend on the dictionary window before them, and any container with no block layout at all.
 pub fn block_access<B: Deref<Target = [u8]> + Sync + 'static>(
     compressed: B,
     codec: Codec,
@@ -242,11 +273,10 @@ impl<B: Deref<Target = [u8]>> BgzfAccess<B> {
         }
     }
 
-    /// Every block's offset and sizes, walked from offset zero on the first query.
+    /// Every block's offset and sizes, walked once on first use and shared thereafter.
     ///
-    /// A 200 GB file holds roughly 3.1 million blocks and the walk faults about 13 GB of
-    /// headers and trailers, so a run that only reads forward from the front never asks and
-    /// never pays.
+    /// A 200 GB file holds roughly 3.1 million blocks and the walk faults about 13 GB of headers
+    /// and trailers, so a run that only reads forward from the front never asks and never pays.
     fn table(&self) -> &[BgzfBlockEntry] {
         self.table.get_or_init(|| {
             let mut entries = Vec::new();
@@ -282,19 +312,17 @@ impl<B: Deref<Target = [u8]>> BgzfAccess<B> {
     /// Block zero is the one query that answers without a table, and it is the one a serial
     /// run over a 200 GB file asks.
     fn offset_of_block(&self, from_block: usize) -> usize {
-        match from_block {
-            0 => 0,
-            index => {
-                let table = self.table();
-                match table.get(index) {
-                    Some(entry) => entry.compressed_offset as usize,
-                    // Past the last block, so the reader opens on the end of the chain and
-                    // gives back nothing.
-                    None => table.last().map_or(0, |last| {
-                        (last.compressed_offset + u64::from(last.compressed_bytes)) as usize
-                    }),
-                }
-            }
+        if from_block == 0 {
+            return 0;
+        }
+        let table = self.table();
+        match table.get(from_block) {
+            Some(entry) => entry.compressed_offset as usize,
+            // Past the last block, so the reader opens on the end of the chain and gives back
+            // nothing.
+            None => table.last().map_or(0, |last| {
+                (last.compressed_offset + u64::from(last.compressed_bytes)) as usize
+            }),
         }
     }
 }
@@ -411,8 +439,7 @@ struct BgzfReader<'a> {
     compressed: &'a [u8],
     /// Compressed offset of the block to inflate next.
     cursor: usize,
-    decoded: Vec<u8>,
-    handed_out: usize,
+    decoded: DecodedBlock,
     inflate: flate2::Decompress,
 }
 
@@ -422,8 +449,7 @@ impl<'a> BgzfReader<'a> {
         Self {
             compressed,
             cursor: from_offset.min(compressed.len()),
-            decoded: Vec::new(),
-            handed_out: 0,
+            decoded: DecodedBlock::default(),
             inflate: flate2::Decompress::new(false),
         }
     }
@@ -435,23 +461,19 @@ impl Read for BgzfReader<'_> {
         // An empty block — the end-of-file marker, or a flush of an empty buffer — decodes to
         // nothing, and handing back zero would read as end of stream, so keep inflating until
         // there is something to give.
-        while self.handed_out == self.decoded.len() {
+        while self.decoded.is_drained() {
             if self.cursor >= self.compressed.len() {
                 return Ok(0);
             }
-            let size = inflate_bgzf_block(
-                &mut self.inflate,
-                self.compressed,
-                self.cursor,
-                &mut self.decoded,
-            )?;
-            self.handed_out = 0;
+            let inflate = &mut self.inflate;
+            let compressed = self.compressed;
+            let offset = self.cursor;
+            let size = self
+                .decoded
+                .refill(|bytes| inflate_bgzf_block(inflate, compressed, offset, bytes))?;
             self.cursor += size;
         }
-        let take = out.len().min(self.decoded.len() - self.handed_out);
-        out[..take].copy_from_slice(&self.decoded[self.handed_out..self.handed_out + take]);
-        self.handed_out += take;
-        Ok(take)
+        Ok(self.decoded.hand_out(out))
     }
 }
 
@@ -479,7 +501,8 @@ struct XzBlockEntry {
     payload_end: usize,
     /// Exact, from the index record, which carries it for every block.
     uncompressed_size: usize,
-    /// Window the payload was coded against, from the block header's LZMA2 property byte.
+    /// Dictionary window the payload was coded against, from the block header's LZMA2 property
+    /// byte.
     dictionary_size: u32,
 }
 
@@ -625,6 +648,136 @@ fn xz_payload_bounds(
     (payload_end >= payload_offset).then_some((payload_offset, payload_end, dictionary_size))
 }
 
+/// One index record: what a block occupies on disk, and what it decodes to.
+#[cfg(feature = "xz")]
+#[derive(Clone, Copy)]
+struct XzIndexRecord {
+    /// Header, payload and check, before the padding that rounds the block to four bytes.
+    unpadded_size: usize,
+    /// Exact, since the index carries it for every block.
+    uncompressed_size: usize,
+}
+
+/// Bytes one block occupies with its padding, which is the step from one header to the next.
+#[cfg(feature = "xz")]
+fn xz_padded_span(unpadded_size: usize) -> usize {
+    (unpadded_size + 3) & !3
+}
+
+/// What a stream footer states: the width of the check trailing every payload, and where the
+/// index begins.
+#[cfg(feature = "xz")]
+struct XzFooter {
+    stream_flags: [u8; 2],
+    check_bytes: usize,
+    index_start: usize,
+}
+
+/// Read the footer ending at `tail`, which is the last byte of the stream.
+#[cfg(feature = "xz")]
+fn xz_footer(compressed: &[u8], tail: usize) -> Option<XzFooter> {
+    if tail < 24 || compressed[tail - 2..tail] != XZ_FOOTER_MAGIC {
+        return None;
+    }
+    let stream_flags = [compressed[tail - 4], compressed[tail - 3]];
+    // The check trails every block's payload, and getting its width wrong shifts every payload
+    // end in the stream.
+    let check_bytes = match stream_flags[1] & 0x0F {
+        0 => 0usize,
+        1..=3 => 4,
+        4..=6 => 8,
+        7..=9 => 16,
+        10..=12 => 32,
+        _ => 64,
+    };
+    let backward_size = u32::from_le_bytes([
+        compressed[tail - 8],
+        compressed[tail - 7],
+        compressed[tail - 6],
+        compressed[tail - 5],
+    ]) as usize;
+    let index_size = (backward_size + 1) * 4;
+    Some(XzFooter {
+        stream_flags,
+        check_bytes,
+        index_start: tail.checked_sub(12 + index_size)?,
+    })
+}
+
+/// Every record of the index beginning at `index_start`, in the order the blocks appear.
+#[cfg(feature = "xz")]
+fn xz_index_records(compressed: &[u8], index_start: usize) -> Option<Vec<XzIndexRecord>> {
+    // The index opens on a zero indicator byte, which is what marks it as an index at all.
+    if *compressed.get(index_start)? != 0x00 {
+        return None;
+    }
+    let mut cursor = index_start + 1;
+    let record_count = read_variable_integer(compressed, &mut cursor)? as usize;
+    let mut records = Vec::new();
+    for _ in 0..record_count {
+        let unpadded_size = read_variable_integer(compressed, &mut cursor)? as usize;
+        let uncompressed_size = read_variable_integer(compressed, &mut cursor)? as usize;
+        if unpadded_size == 0 {
+            return None;
+        }
+        records.push(XzIndexRecord {
+            unpadded_size,
+            uncompressed_size,
+        });
+    }
+    Some(records)
+}
+
+/// Offset of the stream header these records describe, proven rather than assumed.
+///
+/// The header sits exactly one span of padded blocks plus twelve bytes ahead of the index.
+/// Asserting it is what proves this index describes these bytes rather than another file's, and
+/// it is what catches a second stream concatenated ahead of this one.
+#[cfg(feature = "xz")]
+fn xz_stream_start(
+    compressed: &[u8],
+    index_start: usize,
+    records: &[XzIndexRecord],
+    stream_flags: [u8; 2],
+) -> Option<usize> {
+    let blocks_span: usize = records
+        .iter()
+        .map(|record| xz_padded_span(record.unpadded_size))
+        .sum();
+    let stream_start = index_start.checked_sub(blocks_span + 12)?;
+    if compressed.get(stream_start..stream_start + 6)? != XZ_HEADER_MAGIC
+        || compressed[stream_start + 6..stream_start + 8] != stream_flags
+    {
+        return None;
+    }
+    Some(stream_start)
+}
+
+/// One entry per index record, each locating its payload through its own block header.
+#[cfg(feature = "xz")]
+fn xz_stream_entries(
+    compressed: &[u8],
+    stream_start: usize,
+    records: &[XzIndexRecord],
+    check_bytes: usize,
+) -> Option<Vec<XzBlockEntry>> {
+    let mut entries = Vec::with_capacity(records.len());
+    let mut header_offset = stream_start + 12;
+    for record in records {
+        let (payload_offset, payload_end, dictionary_size) =
+            xz_payload_bounds(compressed, header_offset, record.unpadded_size, check_bytes)?;
+        entries.push(XzBlockEntry {
+            compressed_offset: header_offset,
+            payload_offset,
+            payload_end,
+            uncompressed_size: record.uncompressed_size,
+            dictionary_size,
+        });
+        header_offset += xz_padded_span(record.unpadded_size);
+    }
+    Some(entries)
+}
+
 /// Every block of every stream, walking backwards from the last byte.
 ///
 /// Backwards because only the footer states where the index begins, and only the index states
@@ -645,71 +798,20 @@ fn xz_block_table(compressed: &[u8]) -> Option<Vec<XzBlockEntry>> {
         if tail == 0 {
             break;
         }
-        if tail < 24 || compressed[tail - 2..tail] != XZ_FOOTER_MAGIC {
-            return None;
-        }
-        let stream_flags = [compressed[tail - 4], compressed[tail - 3]];
-        // The check trails every block's payload, and getting its width wrong shifts every
-        // payload end in the stream.
-        let check_bytes = match stream_flags[1] & 0x0F {
-            0 => 0usize,
-            1..=3 => 4,
-            4..=6 => 8,
-            7..=9 => 16,
-            10..=12 => 32,
-            _ => 64,
-        };
-        let backward_size = u32::from_le_bytes([
-            compressed[tail - 8],
-            compressed[tail - 7],
-            compressed[tail - 6],
-            compressed[tail - 5],
-        ]) as usize;
-        let index_size = (backward_size + 1) * 4;
-        let index_start = tail.checked_sub(12 + index_size)?;
-        if compressed[index_start] != 0x00 {
-            return None;
-        }
-
-        let mut cursor = index_start + 1;
-        let record_count = read_variable_integer(compressed, &mut cursor)? as usize;
-        let mut records = Vec::new();
-        let mut blocks_span = 0usize;
-        for _ in 0..record_count {
-            let unpadded_size = read_variable_integer(compressed, &mut cursor)? as usize;
-            let uncompressed_size = read_variable_integer(compressed, &mut cursor)? as usize;
-            if unpadded_size == 0 {
-                return None;
-            }
-            records.push((unpadded_size, uncompressed_size));
-            blocks_span += (unpadded_size + 3) & !3;
-        }
-
-        // The stream header sits exactly one span plus twelve bytes ahead of the index.
-        // Asserting it is what proves this index describes these bytes rather than another
-        // file's, and it is what catches a second stream concatenated ahead of this one.
-        let stream_start = index_start.checked_sub(blocks_span + 12)?;
-        if compressed.get(stream_start..stream_start + 6)? != XZ_HEADER_MAGIC
-            || compressed[stream_start + 6..stream_start + 8] != stream_flags
-        {
-            return None;
-        }
-
-        let mut entries = Vec::with_capacity(records.len());
-        let mut header_offset = stream_start + 12;
-        for (unpadded_size, uncompressed_size) in records {
-            let (payload_offset, payload_end, dictionary_size) =
-                xz_payload_bounds(compressed, header_offset, unpadded_size, check_bytes)?;
-            entries.push(XzBlockEntry {
-                compressed_offset: header_offset,
-                payload_offset,
-                payload_end,
-                uncompressed_size,
-                dictionary_size,
-            });
-            header_offset += (unpadded_size + 3) & !3;
-        }
-        streams.push(entries);
+        let footer = xz_footer(compressed, tail)?;
+        let records = xz_index_records(compressed, footer.index_start)?;
+        let stream_start = xz_stream_start(
+            compressed,
+            footer.index_start,
+            &records,
+            footer.stream_flags,
+        )?;
+        streams.push(xz_stream_entries(
+            compressed,
+            stream_start,
+            &records,
+            footer.check_bytes,
+        )?);
         tail = stream_start;
     }
     streams.reverse();
@@ -779,7 +881,10 @@ impl<B: Deref<Target = [u8]>> Lz4Access<B> {
         }
     }
 
-    /// The block table, walked once on first use and shared thereafter.
+    /// Every block's offset and sizes, walked once on first use and shared thereafter.
+    ///
+    /// A frame carries no index, so the walk follows the chain of length prefixes to the end of
+    /// the file, and a run that only reads forward from the front never asks and never pays.
     fn table(&self) -> &[Lz4BlockEntry] {
         self.table.get_or_init(|| lz4_block_table(&self.compressed))
     }
@@ -866,8 +971,8 @@ fn lz4_frame_maximum(sizes: u8) -> Option<usize> {
 /// Whether a frame descriptor, starting at its flags byte, opens blocks that decode alone.
 ///
 /// Block independence is the whole question. A writer told to link its blocks produces a
-/// perfectly valid frame whose every block references the window before it, so none of them
-/// decodes alone and the file belongs on the stream tier.
+/// perfectly valid frame whose every block references the dictionary window before it, so none
+/// of them decodes alone and the file belongs on the stream tier.
 #[cfg(feature = "lz4")]
 fn lz4_frame_is_addressable(descriptor: &[u8]) -> bool {
     let (Some(&flags), Some(&sizes)) = (descriptor.first(), descriptor.get(1)) else {
@@ -971,31 +1076,12 @@ mod tests {
 
     use super::*;
 
+    // Every test that reads a fixture here reads it through a container, and a build with no
+    // codec compiles none of them.
+    #[cfg(any(feature = "gzip", feature = "xz", feature = "lz4"))]
+    use crate::fixtures;
+
     // region: What every implementation owes
-
-    /// FASTQ of ragged records, so a record straddles a block boundary far more often than not.
-    fn ragged_fastq(records: usize) -> Vec<u8> {
-        let mut data = Vec::new();
-        for index in 0..records {
-            let width = 8 + (index % 5) * 4;
-            data.extend_from_slice(format!("@read{index} sample\n").as_bytes());
-            data.extend(std::iter::repeat_n(b"ACGT"[index % 4], width));
-            data.extend_from_slice(b"\n+\n");
-            data.extend(std::iter::repeat_n(b'I', width));
-            data.push(b'\n');
-        }
-        data
-    }
-
-    /// FASTQ of records exactly thirty-two bytes wide, so a block boundary can land exactly on a
-    /// record start. A ragged fixture never does, and a budget off by one still passes there.
-    fn aligned_fastq(records: usize) -> Vec<u8> {
-        let mut data = Vec::new();
-        for index in 0..records {
-            data.extend_from_slice(format!("@read{index:06}\nACGTACGT\n+\nIIIIIIII\n").as_bytes());
-        }
-        data
-    }
 
     /// Headers of every record a plain mapping yields, which is what every tier owes.
     fn headers_in_bytes(plain: &[u8]) -> Vec<Vec<u8>> {
@@ -1040,7 +1126,7 @@ mod tests {
         let mut decoder = access.decoder();
         let mut decoded = Vec::new();
         let mut rejoined = Vec::new();
-        let mut budget = 0usize;
+        let mut decoded_total = 0usize;
         for index in 0..access.block_count() {
             decoder.decode_into(index, &mut decoded).unwrap();
             let stated = access.bytes_in_block(index);
@@ -1051,13 +1137,13 @@ mod tests {
             if let Some(exact) = stated.exact() {
                 assert_eq!(exact, decoded.len(), "{label}: block {index} declared size");
             }
-            budget += stated.upper_bound();
+            decoded_total += stated.upper_bound();
             rejoined.extend_from_slice(&decoded);
         }
         assert_eq!(rejoined, plain, "{label}: blocks must tile the input");
         assert!(
-            budget >= plain.len(),
-            "{label}: the budget must cover the decoded length"
+            decoded_total >= plain.len(),
+            "{label}: the summed upper bounds must cover the decoded length"
         );
     }
 
@@ -1075,40 +1161,6 @@ mod tests {
 
     // region: BGZF
 
-    /// Write `payload` as one BGZF block.
-    #[cfg(feature = "gzip")]
-    fn bgzf_block(payload: &[u8]) -> Vec<u8> {
-        let mut deflated = Vec::with_capacity(payload.len() + 64);
-        let mut compress = flate2::Compress::new(flate2::Compression::fast(), false);
-        compress
-            .compress_vec(payload, &mut deflated, flate2::FlushCompress::Finish)
-            .unwrap();
-        let mut checksum = flate2::Crc::new();
-        checksum.update(payload);
-
-        let size = 12 + 6 + deflated.len() + 8;
-        let mut out = vec![0x1f, 0x8b, 0x08, 0x04, 0, 0, 0, 0, 0, 0xff, 6, 0];
-        out.extend_from_slice(b"BC");
-        out.extend_from_slice(&2u16.to_le_bytes());
-        out.extend_from_slice(&((size - 1) as u16).to_le_bytes());
-        out.extend_from_slice(&deflated);
-        out.extend_from_slice(&checksum.sum().to_le_bytes());
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        out
-    }
-
-    /// A file of deliberately tiny blocks, so a record straddling a block is the common case
-    /// rather than a rare one — the same trick `ShortReader` plays for pipes.
-    #[cfg(feature = "gzip")]
-    fn bgzf_bytes(plain: &[u8], payload_bytes: usize) -> Vec<u8> {
-        let mut out = Vec::new();
-        for chunk in plain.chunks(payload_bytes) {
-            out.extend_from_slice(&bgzf_block(chunk));
-        }
-        out.extend_from_slice(&bgzf_block(b""));
-        out
-    }
-
     /// Everything a reader opening at `from_block` inflates.
     #[cfg(feature = "gzip")]
     fn bgzf_decoded_from(compressed: &[u8], from_block: usize) -> Vec<u8> {
@@ -1122,9 +1174,9 @@ mod tests {
     #[cfg(feature = "gzip")]
     #[test]
     fn bgzf_blocks_inflate_to_the_original_bytes() {
-        let plain = ragged_fastq(200);
+        let plain = fixtures::records(fixtures::SHORT_FASTQ, 200);
         for payload_bytes in [64, 512, 4096, 1 << 16] {
-            let compressed = bgzf_bytes(&plain, payload_bytes);
+            let compressed = fixtures::bgzf_bytes(&plain, payload_bytes);
             assert_eq!(
                 bgzf_decoded_from(&compressed, 0),
                 plain,
@@ -1137,12 +1189,12 @@ mod tests {
     #[cfg(feature = "gzip")]
     #[test]
     fn an_empty_bgzf_block_mid_file_does_not_end_the_stream() {
-        let plain = ragged_fastq(20);
+        let plain = fixtures::records(fixtures::SHORT_FASTQ, 20);
         let half = plain.len() / 2;
         let boundary = plain[half..].iter().position(|&byte| byte == b'@').unwrap() + half;
-        let mut compressed = bgzf_block(&plain[..boundary]);
-        compressed.extend_from_slice(&bgzf_block(b""));
-        compressed.extend_from_slice(&bgzf_block(&plain[boundary..]));
+        let mut compressed = fixtures::bgzf_block(&plain[..boundary]);
+        compressed.extend_from_slice(&fixtures::bgzf_block(b""));
+        compressed.extend_from_slice(&fixtures::bgzf_block(&plain[boundary..]));
 
         assert_eq!(bgzf_decoded_from(&compressed, 0), plain);
     }
@@ -1151,16 +1203,16 @@ mod tests {
     #[cfg(feature = "gzip")]
     #[test]
     fn a_missing_bgzf_end_marker_still_reads() {
-        let plain = ragged_fastq(10);
-        assert_eq!(bgzf_decoded_from(&bgzf_block(&plain), 0), plain);
+        let plain = fixtures::records(fixtures::SHORT_FASTQ, 10);
+        assert_eq!(bgzf_decoded_from(&fixtures::bgzf_block(&plain), 0), plain);
     }
 
     /// The table names every block a walk from offset zero finds, and names it the same way.
     #[cfg(feature = "gzip")]
     #[test]
     fn the_bgzf_table_matches_a_walk_from_offset_zero() {
-        let plain = ragged_fastq(120);
-        let compressed = bgzf_bytes(&plain, 256);
+        let plain = fixtures::records(fixtures::SHORT_FASTQ, 120);
+        let compressed = fixtures::bgzf_bytes(&plain, 256);
         let access = BgzfAccess::new(&compressed[..]).unwrap();
 
         let mut offset = 0usize;
@@ -1184,17 +1236,24 @@ mod tests {
         assert_eq!(offset, compressed.len(), "the walk must reach the end");
     }
 
-    /// The contract, over a ragged fixture and over one whose records tile its blocks exactly.
+    /// The contract, over every shape the table holds and over one whose records tile its
+    /// blocks exactly.
     #[cfg(feature = "gzip")]
     #[test]
     fn bgzf_conforms() {
-        for (plain, payload_bytes, label) in [
-            (ragged_fastq(300), 256usize, "ragged"),
-            (aligned_fastq(300), 256, "aligned"),
-        ] {
-            let access = BgzfAccess::new(bgzf_bytes(&plain, payload_bytes)).unwrap();
-            conforms(&access, &plain, label);
-            an_empty_run_reads_nothing(&access, label);
+        let mut inputs: Vec<(Vec<u8>, String)> = fixtures::ALL
+            .into_iter()
+            .map(|shape| {
+                let count = fixtures::count_within(shape, 8 << 10);
+                (fixtures::records(shape, count), format!("{shape:?}"))
+            })
+            .collect();
+        inputs.push((fixtures::uniform_records(300), "aligned".to_string()));
+
+        for (plain, label) in inputs {
+            let access = BgzfAccess::new(fixtures::bgzf_bytes(&plain, 256)).unwrap();
+            conforms(&access, &plain, &label);
+            an_empty_run_reads_nothing(&access, &label);
         }
     }
 
@@ -1203,7 +1262,8 @@ mod tests {
     #[test]
     fn plain_gzip_is_not_block_addressable() {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        std::io::Write::write_all(&mut encoder, &ragged_fastq(10)).unwrap();
+        std::io::Write::write_all(&mut encoder, &fixtures::records(fixtures::SHORT_FASTQ, 10))
+            .unwrap();
         let compressed = encoder.finish().unwrap();
         assert!(BgzfAccess::new(&compressed[..]).is_err());
     }
@@ -1220,7 +1280,7 @@ mod tests {
     #[cfg(feature = "gzip")]
     #[test]
     fn rejected_bytes_come_back_to_the_caller() {
-        let plain = ragged_fastq(4);
+        let plain = fixtures::records(fixtures::SHORT_FASTQ, 4);
         match BgzfAccess::new(plain.clone()) {
             Ok(_) => panic!("plain FASTQ must not read as BGZF"),
             Err(returned) => assert_eq!(returned, plain),
@@ -1231,8 +1291,8 @@ mod tests {
     #[cfg(feature = "gzip")]
     #[test]
     fn a_borrowed_bgzf_view_inflates_the_same_bytes() {
-        let plain = ragged_fastq(50);
-        let owned = BgzfAccess::new(bgzf_bytes(&plain, 256)).unwrap();
+        let plain = fixtures::records(fixtures::SHORT_FASTQ, 50);
+        let owned = BgzfAccess::new(fixtures::bgzf_bytes(&plain, 256)).unwrap();
         let view = owned.borrowed();
         assert_eq!(view.block_count(), owned.block_count());
 
@@ -1245,42 +1305,19 @@ mod tests {
 
     // region: xz
 
-    /// One xz stream over `payload`, in blocks of `block_bytes` when one is given.
-    #[cfg(feature = "xz")]
-    fn xz_stream(
-        payload: &[u8],
-        block_bytes: Option<u64>,
-        check: lzma_rust2::CheckType,
-    ) -> Vec<u8> {
-        use io::Write;
-        let mut options = lzma_rust2::XzOptions::with_preset(0);
-        options.set_check_sum_type(check);
-        options.set_block_size(block_bytes.and_then(std::num::NonZeroU64::new));
-        let mut writer = lzma_rust2::XzWriter::new(Vec::new(), options).unwrap();
-        writer.write_all(payload).unwrap();
-        writer.finish().unwrap()
-    }
-
-    /// `plain` as one single-block stream per chunk, which is what `cat a.xz b.xz` writes and
-    /// the cheapest multi-block fixture there is.
-    #[cfg(feature = "xz")]
-    fn xz_streams(plain: &[u8], chunk_bytes: usize) -> Vec<u8> {
-        let mut out = Vec::new();
-        for chunk in plain.chunks(chunk_bytes) {
-            out.extend_from_slice(&xz_stream(chunk, None, lzma_rust2::CheckType::Crc64));
-        }
-        out
-    }
-
     /// The contract, over concatenated streams that are ragged and aligned in turn.
     #[cfg(feature = "xz")]
     #[test]
     fn xz_conforms() {
         for (plain, chunk_bytes, label) in [
-            (ragged_fastq(300), 1024usize, "ragged"),
-            (aligned_fastq(300), 1024, "aligned"),
+            (
+                fixtures::records(fixtures::SHORT_FASTQ, 300),
+                1024usize,
+                "ragged",
+            ),
+            (fixtures::uniform_records(300), 1024, "aligned"),
         ] {
-            let access = XzAccess::new(xz_streams(&plain, chunk_bytes)).unwrap();
+            let access = XzAccess::new(fixtures::xz_streams(&plain, chunk_bytes)).unwrap();
             conforms(&access, &plain, label);
             an_empty_run_reads_nothing(&access, label);
         }
@@ -1291,10 +1328,10 @@ mod tests {
     #[cfg(feature = "xz")]
     #[test]
     fn xz_concatenated_streams_are_all_reachable() {
-        let plain = ragged_fastq(120);
+        let plain = fixtures::records(fixtures::SHORT_FASTQ, 120);
         let streams = 4usize;
         let chunk_bytes = plain.len().div_ceil(streams);
-        let access = XzAccess::new(xz_streams(&plain, chunk_bytes)).unwrap();
+        let access = XzAccess::new(fixtures::xz_streams(&plain, chunk_bytes)).unwrap();
         assert_eq!(access.block_count(), streams);
         conforms(&access, &plain, "four streams");
     }
@@ -1303,11 +1340,12 @@ mod tests {
     #[cfg(feature = "xz")]
     #[test]
     fn xz_stream_padding_is_stepped_over() {
-        let plain = ragged_fastq(60);
+        let plain = fixtures::records(fixtures::SHORT_FASTQ, 60);
         let half = plain.len() / 2;
-        let mut compressed = xz_stream(&plain[..half], None, lzma_rust2::CheckType::Crc64);
+        let mut compressed =
+            fixtures::xz_stream(&plain[..half], None, lzma_rust2::CheckType::Crc64);
         compressed.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
-        compressed.extend_from_slice(&xz_stream(
+        compressed.extend_from_slice(&fixtures::xz_stream(
             &plain[half..],
             None,
             lzma_rust2::CheckType::Crc64,
@@ -1324,7 +1362,7 @@ mod tests {
     #[cfg(feature = "xz")]
     #[test]
     fn every_xz_check_type_locates_its_payloads() {
-        let plain = ragged_fastq(80);
+        let plain = fixtures::records(fixtures::SHORT_FASTQ, 80);
         let chunk_bytes = plain.len().div_ceil(3);
         for check in [
             lzma_rust2::CheckType::None,
@@ -1334,7 +1372,7 @@ mod tests {
         ] {
             let mut compressed = Vec::new();
             for chunk in plain.chunks(chunk_bytes) {
-                compressed.extend_from_slice(&xz_stream(chunk, None, check));
+                compressed.extend_from_slice(&fixtures::xz_stream(chunk, None, check));
             }
             let access = XzAccess::new(compressed).unwrap();
             conforms(&access, &plain, &format!("{check:?}"));
@@ -1349,8 +1387,8 @@ mod tests {
         // The writer clamps a block to at least the dictionary, which preset zero puts at
         // 256 KiB, so the fixture has to be larger than that to hold more than one block.
         let block_bytes = 256usize << 10;
-        let plain = aligned_fastq(3 * block_bytes / 32);
-        let compressed = xz_stream(
+        let plain = fixtures::uniform_records(3 * block_bytes / fixtures::UNIFORM_RECORD_BYTES);
+        let compressed = fixtures::xz_stream(
             &plain,
             Some(block_bytes as u64),
             lzma_rust2::CheckType::Crc64,
@@ -1364,7 +1402,11 @@ mod tests {
     #[cfg(feature = "xz")]
     #[test]
     fn a_single_block_xz_file_is_not_block_addressable() {
-        let compressed = xz_stream(&ragged_fastq(40), None, lzma_rust2::CheckType::Crc64);
+        let compressed = fixtures::xz_stream(
+            &fixtures::records(fixtures::SHORT_FASTQ, 40),
+            None,
+            lzma_rust2::CheckType::Crc64,
+        );
         assert_eq!(Codec::detect(&compressed), Codec::Xz);
         assert!(XzAccess::new(&compressed[..]).is_err());
     }
@@ -1408,7 +1450,7 @@ mod tests {
     #[test]
     fn an_xz_filter_chain_is_rejected() {
         use io::Write;
-        let plain = ragged_fastq(60);
+        let plain = fixtures::records(fixtures::SHORT_FASTQ, 60);
         let half = plain.len() / 2;
         let mut compressed = Vec::new();
         for chunk in [&plain[..half], &plain[half..]] {
@@ -1424,15 +1466,6 @@ mod tests {
     // endregion: xz
 
     // region: lz4
-
-    /// `plain` as one frame written under `frame_info`.
-    #[cfg(feature = "lz4")]
-    fn lz4_frame(plain: &[u8], frame_info: lz4_flex::frame::FrameInfo) -> Vec<u8> {
-        use io::Write;
-        let mut encoder = lz4_flex::frame::FrameEncoder::with_frame_info(frame_info, Vec::new());
-        encoder.write_all(plain).unwrap();
-        encoder.finish().unwrap()
-    }
 
     /// A frame descriptor with block independence set and the smallest frame maximum.
     #[cfg(feature = "lz4")]
@@ -1456,12 +1489,13 @@ mod tests {
     #[cfg(feature = "lz4")]
     #[test]
     fn lz4_conforms() {
-        let records = 3 * (64 << 10) / 32;
+        let records = 3 * (64 << 10) / fixtures::UNIFORM_RECORD_BYTES;
         for (plain, label) in [
-            (ragged_fastq(records), "ragged"),
-            (aligned_fastq(records), "aligned"),
+            (fixtures::records(fixtures::SHORT_FASTQ, records), "ragged"),
+            (fixtures::uniform_records(records), "aligned"),
         ] {
-            let access = Lz4Access::new(lz4_frame(&plain, lz4_independent_blocks())).unwrap();
+            let access =
+                Lz4Access::new(fixtures::lz4_frame(&plain, lz4_independent_blocks())).unwrap();
             conforms(&access, &plain, label);
             an_empty_run_reads_nothing(&access, label);
         }
@@ -1473,7 +1507,7 @@ mod tests {
     #[test]
     fn lz4_blocks_are_at_most_the_frame_maximum() {
         use io::Write;
-        let plain = ragged_fastq(40);
+        let plain = fixtures::records(fixtures::SHORT_FASTQ, 40);
         let mut encoder =
             lz4_flex::frame::FrameEncoder::with_frame_info(lz4_independent_blocks(), Vec::new());
         let mut boundary = 0usize;
@@ -1506,13 +1540,13 @@ mod tests {
     #[cfg(feature = "lz4")]
     #[test]
     fn lz4_concatenated_frames_are_all_reachable() {
-        let plain = ragged_fastq(200);
+        let plain = fixtures::records(fixtures::SHORT_FASTQ, 200);
         let half = plain.len() / 2;
-        let mut compressed = lz4_frame(&plain[..half], lz4_independent_blocks());
+        let mut compressed = fixtures::lz4_frame(&plain[..half], lz4_independent_blocks());
         let wider = lz4_flex::frame::FrameInfo::new()
             .block_size(lz4_flex::frame::BlockSize::Max256KB)
             .content_size(Some((plain.len() - half) as u64));
-        compressed.extend_from_slice(&lz4_frame(&plain[half..], wider));
+        compressed.extend_from_slice(&fixtures::lz4_frame(&plain[half..], wider));
 
         let access = Lz4Access::new(compressed).unwrap();
         assert_eq!(access.block_count(), 2, "one block per frame here");
@@ -1526,12 +1560,18 @@ mod tests {
     #[cfg(feature = "lz4")]
     #[test]
     fn an_lz4_skippable_frame_is_stepped_over() {
-        let plain = ragged_fastq(200);
+        let plain = fixtures::records(fixtures::SHORT_FASTQ, 200);
         let half = plain.len() / 2;
         let mut compressed = lz4_skippable_frame(33);
-        compressed.extend_from_slice(&lz4_frame(&plain[..half], lz4_independent_blocks()));
+        compressed.extend_from_slice(&fixtures::lz4_frame(
+            &plain[..half],
+            lz4_independent_blocks(),
+        ));
         compressed.extend_from_slice(&lz4_skippable_frame(7));
-        compressed.extend_from_slice(&lz4_frame(&plain[half..], lz4_independent_blocks()));
+        compressed.extend_from_slice(&fixtures::lz4_frame(
+            &plain[half..],
+            lz4_independent_blocks(),
+        ));
 
         let access = Lz4Access::new(compressed).unwrap();
         assert_eq!(access.block_count(), 2);
@@ -1543,11 +1583,11 @@ mod tests {
     #[cfg(feature = "lz4")]
     #[test]
     fn an_lz4_frame_of_linked_blocks_is_not_block_addressable() {
-        let plain = ragged_fastq(200);
+        let plain = fixtures::records(fixtures::SHORT_FASTQ, 200);
         let linked = lz4_flex::frame::FrameInfo::new()
             .block_size(lz4_flex::frame::BlockSize::Max64KB)
             .block_mode(lz4_flex::frame::BlockMode::Linked);
-        let compressed = lz4_frame(&plain, linked);
+        let compressed = fixtures::lz4_frame(&plain, linked);
         assert_eq!(Codec::detect(&compressed), Codec::Lz4);
         assert!(Lz4Access::new(&compressed[..]).is_err());
     }
@@ -1578,8 +1618,8 @@ mod tests {
     #[cfg(feature = "lz4")]
     #[test]
     fn a_truncated_lz4_payload_can_decode_without_an_error() {
-        let plain = aligned_fastq(2000);
-        let whole = lz4_frame(
+        let plain = fixtures::uniform_records(2000);
+        let whole = fixtures::lz4_frame(
             &plain,
             lz4_flex::frame::FrameInfo::new()
                 .block_size(lz4_flex::frame::BlockSize::Max64KB)
@@ -1633,21 +1673,24 @@ mod tests {
     fn every_block_container_is_reachable_through_one_entry_point() {
         #[cfg(feature = "gzip")]
         {
-            let plain = ragged_fastq(120);
-            let access = block_access(bgzf_bytes(&plain, 256), Codec::Bgzf).unwrap();
+            let plain = fixtures::records(fixtures::SHORT_FASTQ, 120);
+            let access = block_access(fixtures::bgzf_bytes(&plain, 256), Codec::Bgzf).unwrap();
             conforms(access.as_ref(), &plain, "BGZF through block_access");
         }
         #[cfg(feature = "xz")]
         {
-            let plain = ragged_fastq(120);
-            let access = block_access(xz_streams(&plain, 1024), Codec::Xz).unwrap();
+            let plain = fixtures::records(fixtures::SHORT_FASTQ, 120);
+            let access = block_access(fixtures::xz_streams(&plain, 1024), Codec::Xz).unwrap();
             conforms(access.as_ref(), &plain, "xz through block_access");
         }
         #[cfg(feature = "lz4")]
         {
-            let plain = ragged_fastq(3 * (64 << 10) / 32);
-            let access =
-                block_access(lz4_frame(&plain, lz4_independent_blocks()), Codec::Lz4).unwrap();
+            let plain = fixtures::records(fixtures::SHORT_FASTQ, 3 * (64 << 10) / 32);
+            let access = block_access(
+                fixtures::lz4_frame(&plain, lz4_independent_blocks()),
+                Codec::Lz4,
+            )
+            .unwrap();
             conforms(access.as_ref(), &plain, "lz4 through block_access");
         }
     }

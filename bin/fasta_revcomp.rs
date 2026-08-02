@@ -29,10 +29,7 @@ use fasterfasta::scheduling::{for_each_record_in_inputs, Parallelism};
 /// Anything outside the alphabet maps to itself, so unexpected bytes survive a round trip
 /// rather than being silently rewritten.
 fn complement_table() -> [u8; 256] {
-    let mut table = [0u8; 256];
-    for (index, entry) in table.iter_mut().enumerate() {
-        *entry = index as u8;
-    }
+    let mut table: [u8; 256] = core::array::from_fn(|index| index as u8);
 
     // Unambiguous bases. Uracil is its own pair with adenine so RNA is an involution:
     // complementing A back to T instead of U would silently transcribe RNA into DNA.
@@ -166,41 +163,33 @@ struct Args {
     parallelism: Parallelism,
 }
 
+fn run(args: &Args) -> io::Result<()> {
+    let rendering = Rendering::for_output(args.output.as_deref());
+    let mut output = open_output(args.output.as_deref())?;
+    let mut workers = args.parallelism.ordered()?;
+    // Each state buffers the records of one unit of work, and `retire` writes that buffer
+    // out in turn, so the output is the same bytes however many workers ran.
+    let mut states =
+        workers.states(|| ReverseComplementer::new(Vec::new(), SequenceFormat::Fasta, rendering));
+
+    for_each_record_in_inputs(
+        &args.inputs,
+        &mut workers,
+        &mut states,
+        ReverseComplementer::push,
+        |state| state.writer.drain_into(&mut output),
+    )?;
+    output.flush()?;
+
+    if args.report {
+        let converted: u64 = states.iter().map(|state| state.converted).sum();
+        eprintln!("converted {converted} records");
+    }
+    Ok(())
+}
+
 fn main() {
-    let args = Args::parse();
-    let report = args.report;
-
-    let result = (|| -> io::Result<()> {
-        let rendering = Rendering::for_output(args.output.as_deref());
-        let mut output = open_output(args.output.as_deref())?;
-        let mut workers = args.parallelism.ordered()?;
-        // Each state buffers the records of one byte range, and `retire` writes that buffer
-        // out in turn, so the output is the same bytes however many workers ran.
-        let mut states = workers
-            .states(|| ReverseComplementer::new(Vec::new(), SequenceFormat::Fasta, rendering));
-
-        for_each_record_in_inputs(
-            &args.inputs,
-            &mut workers,
-            &mut states,
-            ReverseComplementer::push,
-            |state| {
-                let buffered = state.writer.inner_mut();
-                output.write_all(buffered)?;
-                buffered.clear();
-                Ok(())
-            },
-        )?;
-        output.flush()?;
-
-        if report {
-            let converted: u64 = states.iter().map(|state| state.converted).sum();
-            eprintln!("converted {converted} records");
-        }
-        Ok(())
-    })();
-
-    finish_or_exit("Error reverse complementing", result);
+    finish_or_exit("Error reverse complementing", run(&Args::parse()));
 }
 
 #[cfg(test)]

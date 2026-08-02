@@ -194,54 +194,52 @@ struct Args {
     parallelism: Parallelism,
 }
 
+/// The mode the flags ask for, or why they cannot be honoured.
+///
+/// Reported as an error rather than printed here, so a bad flag leaves through the same
+/// epilogue every other tool uses and carries the same prefix.
+fn mode_of(count: Option<usize>, fraction: Option<f64>) -> io::Result<Mode> {
+    let rejected = |reason: String| io::Error::new(io::ErrorKind::InvalidInput, reason);
+    match (count, fraction) {
+        (Some(0), _) => Err(rejected("--count must be at least 1".to_string())),
+        (Some(count), _) => Ok(Mode::Count(count)),
+        (_, Some(fraction)) if (0.0..=1.0).contains(&fraction) => Ok(Mode::Fraction(fraction)),
+        (_, Some(fraction)) => Err(rejected(format!(
+            "--fraction must be between 0.0 and 1.0, got {fraction}"
+        ))),
+        (None, None) => Err(rejected("pass either --count or --fraction".to_string())),
+    }
+}
+
+fn run(args: &Args) -> io::Result<()> {
+    let mode = mode_of(args.count, args.fraction)?;
+
+    let rendering = Rendering::for_output(args.output.as_deref());
+    let output = open_output(args.output.as_deref())?;
+    let mut workers = args.parallelism.ordered()?;
+    // One sampler per unit of work in flight, each folded into `combined` in input order.
+    let mut states = workers.states(|| Sampler::new(Vec::new(), mode, args.seed, rendering));
+    let mut combined = Sampler::new(output, mode, args.seed, rendering);
+
+    for_each_record_in_inputs(
+        &args.inputs,
+        &mut workers,
+        &mut states,
+        Sampler::push,
+        |state| combined.absorb(state),
+    )?;
+    combined.finish()?;
+    if args.report {
+        eprintln!(
+            "examined {} records, retained {}",
+            combined.seen, combined.retained
+        );
+    }
+    Ok(())
+}
+
 fn main() {
-    let args = Args::parse();
-
-    let mode = match (args.count, args.fraction) {
-        (Some(0), _) => {
-            eprintln!("Error: --count must be at least 1");
-            std::process::exit(1);
-        }
-        (Some(count), _) => Mode::Count(count),
-        (_, Some(fraction)) if (0.0..=1.0).contains(&fraction) => Mode::Fraction(fraction),
-        (_, Some(fraction)) => {
-            eprintln!("Error: --fraction must be between 0.0 and 1.0, got {fraction}");
-            std::process::exit(1);
-        }
-        (None, None) => {
-            eprintln!("Error: pass either --count or --fraction");
-            std::process::exit(1);
-        }
-    };
-
-    let report = args.report;
-
-    let result = (|| -> io::Result<()> {
-        let rendering = Rendering::for_output(args.output.as_deref());
-        let output = open_output(args.output.as_deref())?;
-        let mut workers = args.parallelism.ordered()?;
-        // One sampler per byte range in flight, each folded into `combined` in input order.
-        let mut states = workers.states(|| Sampler::new(Vec::new(), mode, args.seed, rendering));
-        let mut combined = Sampler::new(output, mode, args.seed, rendering);
-
-        for_each_record_in_inputs(
-            &args.inputs,
-            &mut workers,
-            &mut states,
-            Sampler::push,
-            |state| combined.absorb(state),
-        )?;
-        combined.finish()?;
-        if report {
-            eprintln!(
-                "examined {} records, retained {}",
-                combined.seen, combined.retained
-            );
-        }
-        Ok(())
-    })();
-
-    finish_or_exit("Error sampling records", result);
+    finish_or_exit("Error sampling records", run(&Args::parse()));
 }
 
 #[cfg(test)]

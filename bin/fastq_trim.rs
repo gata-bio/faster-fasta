@@ -4,9 +4,9 @@
 //! result is capped to a maximum length. Records shorter than a minimum after trimming are
 //! dropped.
 //!
-//! __Memory__: O(1) — trimming resolves to a byte range, so nothing is copied. The previous
-//! implementation allocated two vectors per record, before the minimum-length filter could
-//! reject the record and discard them.
+//! __Memory__: O(1) — trimming resolves to a byte range, so nothing is copied. Resolving to a
+//! range rather than to owned buffers is what makes a record the minimum-length filter rejects
+//! cost nothing but arithmetic.
 //! __Streaming__: yes, for files and pipes alike.
 //!
 //! # Examples
@@ -25,7 +25,7 @@ use clap::Parser;
 use stringzilla::sz::{find_byteset, rfind_byteset, Byteset};
 
 use fasterfasta::files::{finish_or_exit, open_output, RecordWriter, Rendering};
-use fasterfasta::records::{phred33_to_ascii, Record, SequenceFormat};
+use fasterfasta::records::{needs_fastq, phred33_to_ascii, Record, SequenceFormat};
 use fasterfasta::scheduling::{for_each_record_in_inputs, Parallelism};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -104,11 +104,8 @@ impl<W: Write> Trimmer<W> {
     }
 
     fn push(&mut self, record: Record<'_>) -> io::Result<()> {
-        if record.format() == SequenceFormat::Fasta && self.settings.acceptable_scores.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "--quality-cutoff needs FASTQ input, but this input is FASTA",
-            ));
+        if self.settings.acceptable_scores.is_some() {
+            needs_fastq("--quality-cutoff", record.format())?;
         }
         self.writer.adopt(record.format())?;
         self.examined += 1;
@@ -117,12 +114,9 @@ impl<W: Write> Trimmer<W> {
             return Ok(());
         }
 
-        // Quality is empty for FASTA, so it cannot be sliced by the same range.
-        let trimmed_quality = if record.quality.is_empty() {
-            &[][..]
-        } else {
-            &record.quality[range.clone()]
-        };
+        // A FASTA record carries no quality, and the range is an offset into the sequence, so
+        // a range the quality cannot hold yields nothing rather than an out-of-bounds slice.
+        let trimmed_quality = record.quality.get(range.clone()).unwrap_or_default();
 
         self.writer.write_parts(
             record.header_without_sigil(),
@@ -178,9 +172,7 @@ struct Args {
     parallelism: Parallelism,
 }
 
-fn main() {
-    let args = Args::parse();
-
+fn run(args: &Args) -> io::Result<()> {
     let settings = TrimSettings {
         acceptable_scores: args.quality_cutoff.map(acceptable_scores),
         trim_front: args.trim_front,
@@ -189,42 +181,35 @@ fn main() {
         minimum_length: args.min_length,
     };
 
-    let report = args.report;
+    let rendering = Rendering::for_output(args.output.as_deref());
+    let mut output = open_output(args.output.as_deref())?;
+    let mut workers = args.parallelism.ordered()?;
+    // Each state buffers the records of one unit of work, and `retire` writes that buffer
+    // out in turn, so the output is the same bytes however many workers ran.
+    let mut states = workers.states(|| Trimmer::new(Vec::new(), settings, rendering));
 
-    let result = (|| -> io::Result<()> {
-        let rendering = Rendering::for_output(args.output.as_deref());
-        let mut output = open_output(args.output.as_deref())?;
-        let mut workers = args.parallelism.ordered()?;
-        // Each state buffers the records of one byte range, and `retire` writes that buffer
-        // out in turn, so the output is the same bytes however many workers ran.
-        let mut states = workers.states(|| Trimmer::new(Vec::new(), settings, rendering));
+    for_each_record_in_inputs(
+        &args.inputs,
+        &mut workers,
+        &mut states,
+        Trimmer::push,
+        |state| state.writer.drain_into(&mut output),
+    )?;
+    output.flush()?;
 
-        for_each_record_in_inputs(
-            &args.inputs,
-            &mut workers,
-            &mut states,
-            Trimmer::push,
-            |state| {
-                let buffered = state.writer.inner_mut();
-                output.write_all(buffered)?;
-                buffered.clear();
-                Ok(())
-            },
-        )?;
-        output.flush()?;
+    if args.report {
+        let examined: usize = states.iter().map(|state| state.examined).sum();
+        let retained: usize = states.iter().map(|state| state.retained).sum();
+        eprintln!(
+            "examined {examined} records, trimmed {retained}, dropped {} below the minimum length",
+            examined - retained
+        );
+    }
+    Ok(())
+}
 
-        if report {
-            let examined: usize = states.iter().map(|state| state.examined).sum();
-            let retained: usize = states.iter().map(|state| state.retained).sum();
-            eprintln!(
-                "examined {examined} records, trimmed {retained}, dropped {} below the minimum length",
-                examined - retained
-            );
-        }
-        Ok(())
-    })();
-
-    finish_or_exit("Error trimming reads", result);
+fn main() {
+    finish_or_exit("Error trimming reads", run(&Args::parse()));
 }
 
 #[cfg(test)]

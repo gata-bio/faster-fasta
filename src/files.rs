@@ -1,13 +1,14 @@
-//! Faster FASTA — the inputs an operating system hands a tool, and the bytes it hands back.
+//! The inputs an operating system hands a tool, and the bytes it hands back.
 //!
 //! Two regions:
 //!
 //! - __Containers__ — the three input shapes, and how records are read out of each.
 //! - __Output__ — record formatting and the boilerplate every `main` shares.
 //!
-//! This layer sits above [`crate::records`] and reads every record through that parser.
-//! The dependency runs one way only, so nothing in [`crate::records`] names anything here and
-//! a record can be parsed with no file in sight.
+//! This layer sits above three others: every record is read through [`crate::records`], a
+//! compressed source is decoded through [`crate::codecs`], and [`crate::blocks`] answers whether
+//! a mapping is addressable at block granularity. The dependencies run one way only, so none of
+//! the three names anything here and a record can be parsed with no file in sight.
 //!
 //! Scheduling lives in [`crate::scheduling`].
 //! Nothing here spawns a thread or picks a range, and nothing here declares a sibling module.
@@ -16,18 +17,17 @@ use std::io::{self, Read};
 use std::ops::Deref;
 
 use crate::records::{
-    next_record_start, parse_leading_record, sequence_format, ParseOutcome, Record, RecordScratch,
-    RecordStart, SequenceFormat,
+    first_record_boundary, parse_leading_record, sequence_format, ParseOutcome, Record,
+    RecordBoundary, RecordScratch, SequenceFormat,
 };
 
 // region: Containers
 
 /// A whole input held in memory or memory-mapped, addressable at any offset.
 ///
-/// Any byte range can go to a worker, since [`crate::records::next_record_boundary`]
-/// recovers a record
-/// boundary from any offset. Generic over its container so one type serves the owner of a
-/// mapping and the borrower of a view of it alike.
+/// Any byte range can go to a worker, since [`crate::records::first_record_boundary`] recovers
+/// a record boundary from any offset. Generic over its container so one type serves the owner
+/// of a mapping and the borrower of a view of it alike.
 pub struct RandomAccess<B: Deref<Target = [u8]>> {
     data: B,
 }
@@ -76,23 +76,23 @@ impl<B: Deref<Target = [u8]>> RandomAccess<B> {
 
     /// Visit every record in `range`, which must start at a record boundary.
     ///
-    /// Records borrow either the input or a scratch buffer reused across the whole call, so
-    /// this allocates only while warming up.
+    /// A range holding no records is empty rather than malformed, so a worker handed one
+    /// finishes quietly. Records borrow either the input or a scratch buffer reused across the
+    /// whole call, so this allocates only while warming up.
     pub fn for_each_record_in(
         &self,
         range: core::ops::Range<usize>,
         mut visit: impl FnMut(Record<'_>) -> io::Result<()>,
     ) -> io::Result<()> {
         let mut scratch = RecordScratch::new();
-        let region = &self.data[range];
-        // A region with no records is empty, not malformed, so there is nothing to visit.
-        let Some(format) = sequence_format(region)? else {
+        let range = &self.data[range];
+        let Some(format) = sequence_format(range)? else {
             return Ok(());
         };
         let mut consumed = 0usize;
 
-        while consumed < region.len() {
-            match parse_leading_record(&region[consumed..], format, true, &mut scratch) {
+        while consumed < range.len() {
+            match parse_leading_record(&range[consumed..], format, true, &mut scratch) {
                 ParseOutcome::Record(record, used) => {
                     visit(record)?;
                     debug_assert!(used > 0, "parser must make progress");
@@ -148,105 +148,172 @@ impl<R: Read> ForwardAccess<R> {
 
     /// Visit the records beginning in this stretch of the stream, in bounded memory.
     ///
-    /// `decoded_bytes` is how much of the stream belongs to this unit of work, or `None` to
-    /// read to the end. It is consulted before each record rather than after: a record
-    /// straddling the end began inside and is emitted whole, while the first record starting
-    /// past it is left alone. Consulting afterwards would emit that one twice.
-    ///
-    /// The window is compacted at exactly one point, where the only live index is `consumed`
-    /// and it is reset in the same block, so no stale offset can survive a compaction.
+    /// `decoded_bytes` is how much of the stream belongs to this unit of work, or `None` to read
+    /// to the end. It is consulted before each record rather than after: a record straddling the
+    /// end began inside and is emitted whole, while the first record starting past it is left
+    /// alone. Consulting afterwards would emit that one twice.
     pub fn for_each_record_within(
         &mut self,
         start: StreamStart,
         decoded_bytes: Option<usize>,
-        mut visit: impl FnMut(Record<'_>) -> io::Result<()>,
+        visit: impl FnMut(Record<'_>) -> io::Result<()>,
     ) -> io::Result<()> {
-        let mut scratch = RecordScratch::new();
-        let mut filled = 0usize;
-        let mut consumed = 0usize;
-        let mut at_eof = false;
+        let mut window = ParseWindow::new(&mut self.reader, &mut self.window);
 
-        let mut parsed_total = 0usize;
-
-        // A whole stream announces its format with its first record; a window opening
-        // mid-record cannot, so it is told. Either way a stream with no records is empty
-        // rather than malformed.
+        // A whole stream announces its format with its first record; a window opening mid-record
+        // cannot, so it is told. Either way a stream with no records is empty rather than
+        // malformed.
         let format = match start {
             StreamStart::FirstBoundary(format) => format,
-            StreamStart::FirstByte => loop {
-                match sequence_format(&self.window[..filled])? {
-                    Some(format) => break format,
-                    None if at_eof => return Ok(()),
-                    None => {
-                        if filled == self.window.len() {
-                            self.window.resize(self.window.len() * 2, 0);
-                        }
-                        let read_bytes = self.reader.read(&mut self.window[filled..])?;
-                        if read_bytes == 0 {
-                            at_eof = true;
-                        } else {
-                            filled += read_bytes;
-                        }
-                    }
-                }
+            StreamStart::FirstByte => match window.detected_format()? {
+                Some(format) => format,
+                None => return Ok(()),
             },
         };
 
+        // A window opening mid-record inherits the tail of a record the unit of work before it
+        // emits. Skipping it needs the boundary search rather than the parser, because the bytes
+        // ahead of it are not a record.
+        let skipped = match start {
+            StreamStart::FirstByte => 0,
+            StreamStart::FirstBoundary(_) => match window.offset_of_first_record(format)? {
+                Some(boundary) => boundary,
+                None => return Ok(()),
+            },
+        };
+
+        window.visit_records(format, skipped, decoded_bytes, visit)
+    }
+}
+
+/// The bytes one [`ForwardAccess`] run has read, and whether its source has more to give.
+///
+/// `filled` and `at_eof` move only in [`ParseWindow::refill`], so a step that grows the window
+/// cannot miss the source ending, and the three steps of a run share one refill rather than one
+/// each.
+struct ParseWindow<'a, R: Read> {
+    reader: &'a mut R,
+    /// Allocated by the owning [`ForwardAccess`] and reused for the life of the run.
+    window: &'a mut Vec<u8>,
+    /// How much of `window` the source has filled.
+    filled: usize,
+    /// Set by the read that returns nothing, which is the only end a stream announces.
+    at_eof: bool,
+}
+
+impl<'a, R: Read> ParseWindow<'a, R> {
+    /// Opens on an empty window over `reader`, borrowing both rather than owning either.
+    fn new(reader: &'a mut R, window: &'a mut Vec<u8>) -> Self {
+        Self {
+            reader,
+            window,
+            filled: 0,
+            at_eof: false,
+        }
+    }
+
+    /// The bytes read so far, which is what every step of a run looks at.
+    fn filled_bytes(&self) -> &[u8] {
+        &self.window[..self.filled]
+    }
+
+    /// Read once more, growing the window first when it is full, so a record larger than the
+    /// whole window makes room rather than stalling the run.
+    fn refill(&mut self) -> io::Result<()> {
+        if self.filled == self.window.len() {
+            self.window.resize(self.window.len() * 2, 0);
+        }
+        let read_bytes = self.reader.read(&mut self.window[self.filled..])?;
+        if read_bytes == 0 {
+            self.at_eof = true;
+        } else {
+            self.filled += read_bytes;
+        }
+        Ok(())
+    }
+
+    /// Move the bytes from `consumed` onwards to the front of the window.
+    ///
+    /// The one point a run compacts at, and the caller's only live index is `consumed`, which it
+    /// resets in the same block, so no stale offset can survive a compaction.
+    fn compact(&mut self, consumed: usize) {
+        self.window.copy_within(consumed..self.filled, 0);
+        self.filled -= consumed;
+    }
+
+    /// The format the stream's first record announces, reading on until one arrives.
+    ///
+    /// `None` for a source that ends with no record in it, which is empty rather than malformed.
+    fn detected_format(&mut self) -> io::Result<Option<SequenceFormat>> {
+        loop {
+            if let Some(format) = sequence_format(self.filled_bytes())? {
+                return Ok(Some(format));
+            }
+            if self.at_eof {
+                return Ok(None);
+            }
+            self.refill()?;
+        }
+    }
+
+    /// Offset of the first record boundary, past the partial record the window opens on.
+    ///
+    /// `None` when the source ends before any candidate is proven, since nothing more will
+    /// arrive and an unproven candidate stays unproven.
+    fn offset_of_first_record(&mut self, format: SequenceFormat) -> io::Result<Option<usize>> {
+        let mut searched_through = 0usize;
+        loop {
+            let outcome = first_record_boundary(self.filled_bytes(), searched_through, format);
+            if let RecordBoundary::At(boundary) = outcome {
+                return Ok(Some(boundary));
+            }
+            if self.at_eof {
+                return Ok(None);
+            }
+            // Resume where the proof ran out of bytes, not where the scan stopped. A FASTQ cycle
+            // spans four lines, which on a long read is tens of kilobytes, so a candidate near
+            // the end is undecided rather than rejected, and stepping over it drops every record
+            // up to the next.
+            searched_through = match outcome {
+                RecordBoundary::Undecided(resume_from) => resume_from,
+                // Every candidate was judged and rejected; only the newline a two-byte needle
+                // straddles has to be reconsidered.
+                _ => self.filled.saturating_sub(1),
+            };
+            self.refill()?;
+        }
+    }
+
+    /// Parse records from `skipped` onwards and hand each to `visit`, until the budget in
+    /// `decoded_bytes` runs out or the source does.
+    ///
+    /// `skipped` is the prefix ahead of the first record, which is where parsing begins in the
+    /// window and is decoded input the budget has to count.
+    fn visit_records(
+        &mut self,
+        format: SequenceFormat,
+        skipped: usize,
+        decoded_bytes: Option<usize>,
+        mut visit: impl FnMut(Record<'_>) -> io::Result<()>,
+    ) -> io::Result<()> {
         /// What the parse decided, carrying no borrow of the window.
         enum Outcome {
             Consumed(usize),
             NeedMore,
         }
 
-        // A window opening mid-record inherits the tail of a record the unit of work before
-        // it emits. Skipping it needs the boundary search rather than the parser, because the
-        // bytes ahead of it are not a record.
-        if matches!(start, StreamStart::FirstBoundary(_)) {
-            let mut searched_through = 0usize;
-            loop {
-                match next_record_start(&self.window[..filled], searched_through, format) {
-                    RecordStart::At(boundary) => {
-                        consumed = boundary;
-                        // The skipped prefix is decoded input too, and `decoded_bytes` counts
-                        // from the front of this window, so it must be counted here.
-                        parsed_total = boundary;
-                        break;
-                    }
-                    // Nothing more will arrive, so an unproven candidate stays unproven.
-                    RecordStart::Undecided(_) | RecordStart::NotFound if at_eof => return Ok(()),
-                    outcome => {
-                        // Resume where the proof ran out of bytes, not where the scan stopped.
-                        // A FASTQ cycle spans four lines, which on a long read is tens of
-                        // kilobytes, so a candidate near the end is undecided rather than
-                        // rejected, and stepping over it drops every record up to the next.
-                        searched_through = match outcome {
-                            RecordStart::Undecided(resume_from) => resume_from,
-                            // Every candidate was judged and rejected; only the newline a
-                            // two-byte needle straddles has to be reconsidered.
-                            _ => filled.saturating_sub(1),
-                        };
-                        if filled == self.window.len() {
-                            self.window.resize(self.window.len() * 2, 0);
-                        }
-                        let read_bytes = self.reader.read(&mut self.window[filled..])?;
-                        if read_bytes == 0 {
-                            at_eof = true;
-                        } else {
-                            filled += read_bytes;
-                        }
-                    }
-                }
-            }
-        }
+        let mut scratch = RecordScratch::new();
+        let mut consumed = skipped;
+        let mut parsed_total = skipped;
 
         loop {
-            if decoded_bytes.is_some_and(|budget| parsed_total >= budget) {
+            if decoded_bytes.is_some_and(|limit| parsed_total >= limit) {
                 return Ok(());
             }
             let outcome = match parse_leading_record(
-                &self.window[consumed..filled],
+                &self.filled_bytes()[consumed..],
                 format,
-                at_eof,
+                self.at_eof,
                 &mut scratch,
             ) {
                 ParseOutcome::Record(record, used) => {
@@ -257,7 +324,7 @@ impl<R: Read> ForwardAccess<R> {
                 ParseOutcome::Incomplete => Outcome::NeedMore,
                 ParseOutcome::Invalid(error) => return Err(error),
             };
-            // The immutable borrow of `window` ends here, before any mutation below.
+            // The immutable borrow of the window ends here, before any mutation below.
 
             match outcome {
                 Outcome::Consumed(used) => {
@@ -268,31 +335,19 @@ impl<R: Read> ForwardAccess<R> {
                 Outcome::NeedMore => {}
             }
 
-            if at_eof {
-                // At end of input the parser reports `Incomplete` only for trailing
-                // whitespace; a genuine truncation comes back as `Invalid`.
-                break;
+            if self.at_eof {
+                // At end of input the parser reports `Incomplete` only for trailing whitespace;
+                // a genuine truncation comes back as `Invalid`.
+                return Ok(());
             }
 
             if consumed > 0 {
-                self.window.copy_within(consumed..filled, 0);
-                filled -= consumed;
+                self.compact(consumed);
                 consumed = 0;
             }
 
-            if filled == self.window.len() {
-                // One record is larger than the whole window, so grow rather than stall.
-                self.window.resize(self.window.len() * 2, 0);
-            }
-
-            let read_bytes = self.reader.read(&mut self.window[filled..])?;
-            if read_bytes == 0 {
-                at_eof = true;
-            } else {
-                filled += read_bytes;
-            }
+            self.refill()?;
         }
-        Ok(())
     }
 }
 
@@ -310,9 +365,12 @@ pub enum InputFile {
     Bytes(RandomAccess<memmap2::Mmap>),
     /// BLOCK tier: addressable at block granularity, since every block decodes alone.
     ///
+    /// Present whatever the feature set. A build with no block codec never constructs one,
+    /// because [`crate::blocks::block_access`] hands the mapping back instead, and an
+    /// unconditional variant cannot drift out of step with the arms that match it.
+    ///
     /// Boxed because three containers qualify and they share only their trait. Dispatch is one
     /// virtual call per block against decoding tens of kilobytes, so it does not register.
-    #[cfg(any(feature = "gzip", feature = "xz", feature = "lz4"))]
     Blocks(Box<dyn crate::blocks::BlockAccess>),
     /// STREAM tier: forward-only, so decoding stays serial.
     Stream(ForwardAccess<Box<dyn Read>>),
@@ -388,7 +446,6 @@ impl InputFile {
     ) -> io::Result<()> {
         match self {
             InputFile::Bytes(bytes) => bytes.for_each_record(visit),
-            #[cfg(feature = "gzip")]
             InputFile::Blocks(blocks) => {
                 ForwardAccess::new(blocks.reader(0)).for_each_record(visit)
             }
@@ -466,20 +523,18 @@ fn base_color(base: u8) -> Option<&'static [u8]> {
 /// line rather than a decision per byte.
 fn sequence_into(target: &mut Vec<u8>, sequence: &[u8], rendering: Rendering) {
     match (rendering.line_width, rendering.color) {
-        (0, false) => target.extend_from_slice(sequence),
+        (0, false) => {
+            target.extend_from_slice(sequence);
+            target.push(b'\n');
+        }
         (width, false) => {
             for line in sequence.chunks(width) {
                 target.extend_from_slice(line);
                 target.push(b'\n');
             }
-            return;
         }
-        (width, true) => {
-            colored_sequence_into(target, sequence, width);
-            return;
-        }
+        (width, true) => colored_sequence_into(target, sequence, width),
     }
-    target.push(b'\n');
 }
 
 /// Append `sequence` wrapped at `width` and coloured by base.
@@ -639,6 +694,15 @@ impl<W: io::Write> RecordWriter<W> {
     /// the next one means owning the bytes.
     pub fn render_into(&self, record: Record<'_>, target: &mut Vec<u8>) {
         target.clear();
+        self.append_into(record, target);
+    }
+
+    /// Format a record onto the end of `target`, keeping what is already there.
+    ///
+    /// [`RecordWriter::render_into`] replaces the target because its caller keeps one buffer
+    /// per retained record; a caller accumulating a whole range into one buffer needs the
+    /// opposite, and would otherwise render into a scratch and copy it a second time.
+    pub fn append_into(&self, record: Record<'_>, target: &mut Vec<u8>) {
         format_into(
             target,
             self.format,
@@ -665,9 +729,6 @@ impl<W: io::Write> RecordWriter<W> {
     }
 
     /// The sink itself, for a caller draining a buffer between units of work.
-    ///
-    /// A record never straddles two calls, so whatever the sink holds is a whole number of
-    /// records and can be forwarded as it stands.
     pub fn inner_mut(&mut self) -> &mut W {
         &mut self.writer
     }
@@ -693,11 +754,26 @@ pub fn finish_or_exit(context: &str, result: io::Result<()>) {
     }
 }
 
+impl RecordWriter<Vec<u8>> {
+    /// Hand the buffered records to `sink` and empty the buffer for the next unit of work.
+    ///
+    /// A record never straddles two calls, so what leaves is always whole records. Buffering
+    /// into a `Vec` and draining in turn is what makes a parallel run emit the bytes a serial
+    /// one would, whichever worker filled which buffer.
+    pub fn drain_into(&mut self, sink: &mut impl io::Write) -> io::Result<()> {
+        sink.write_all(&self.writer)?;
+        self.writer.clear();
+        Ok(())
+    }
+}
+
 // endregion: Output
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::fixtures;
 
     /// Re-emits every record verbatim, so a driver run can be compared byte for byte
     /// against another driver run over the same input.
@@ -729,51 +805,6 @@ mod tests {
         }
     }
 
-    /// Returns at most `limit` bytes per call, the way a pipe or socket does. `Cursor`
-    /// always satisfies the full request and so can never drive the window through a
-    /// mid-record refill.
-    struct ShortReader<R: Read> {
-        inner: R,
-        limit: usize,
-    }
-
-    impl<R: Read> Read for ShortReader<R> {
-        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-            let capped = out.len().min(self.limit);
-            self.inner.read(&mut out[..capped])
-        }
-    }
-
-    fn sample_fastq(records: usize) -> Vec<u8> {
-        let mut data = Vec::new();
-        for index in 0..records {
-            let width = 8 + (index % 7) * 3;
-            let base = [b'A', b'C', b'G', b'T'][index % 4];
-            data.extend_from_slice(format!("@read{index} sample record\n").as_bytes());
-            data.extend(std::iter::repeat_n(base, width));
-            data.extend_from_slice(b"\n+\n");
-            data.extend(std::iter::repeat_n(b'I', width));
-            data.push(b'\n');
-        }
-        data
-    }
-
-    fn sample_fasta(records: usize) -> Vec<u8> {
-        let mut data = Vec::new();
-        for index in 0..records {
-            let width = 9 + (index % 5) * 4;
-            let base = [b'A', b'C', b'G', b'T'][index % 4];
-            data.extend_from_slice(format!(">contig{index} sample record\n").as_bytes());
-            // Wrapped at 6 columns, so most records exercise the scratch path.
-            for chunk_start in (0..width).step_by(6) {
-                let chunk = (width - chunk_start).min(6);
-                data.extend(std::iter::repeat_n(base, chunk));
-                data.push(b'\n');
-            }
-        }
-        data
-    }
-
     fn drive_bytes(data: &[u8]) -> io::Result<Collector> {
         let mut sink = Collector::default();
         RandomAccess::new(data).for_each_record(|record| sink.push(record))?;
@@ -783,10 +814,7 @@ mod tests {
 
     fn drive_stream(data: &[u8], limit: usize, window: usize) -> io::Result<Collector> {
         let mut sink = Collector::default();
-        let reader = ShortReader {
-            inner: io::Cursor::new(data),
-            limit,
-        };
+        let reader = fixtures::ShortReader::new(io::Cursor::new(data), limit);
         ForwardAccess::with_window(reader, window).for_each_record(|record| sink.push(record))?;
         sink.finish()?;
         Ok(sink)
@@ -794,39 +822,56 @@ mod tests {
 
     /// The property the whole design rests on: however the bytes arrive, the records come
     /// out identical.
+    ///
+    /// Every FASTQ shape the table holds, so a read wider than the window, a CRLF file, a file
+    /// with no final newline, and a quality line opening with '@' all take the same path.
     #[test]
     fn stream_matches_slice_for_fastq() {
-        let data = sample_fastq(40);
-        let expected = drive_bytes(&data).unwrap();
-        assert_eq!(expected.records, 40);
+        for shape in fixtures::ALL
+            .into_iter()
+            .filter(|shape| shape.format == SequenceFormat::Fastq)
+        {
+            let count = fixtures::count_within(shape, 4 << 10);
+            let data = fixtures::records(shape, count);
+            let expected = drive_bytes(&data).unwrap();
+            assert_eq!(expected.records, count, "{shape:?}");
 
-        for limit in [1, 3, 7, 13, 64, 4096] {
-            for window in [64, 128, 1024, DEFAULT_WINDOW_BYTES] {
-                let actual = drive_stream(&data, limit, window)
-                    .unwrap_or_else(|error| panic!("limit {limit}, window {window}: {error}"));
-                assert_eq!(
-                    actual.output, expected.output,
-                    "limit {limit}, window {window}: output diverged"
-                );
-                assert_eq!(actual.records, expected.records);
+            for limit in [1, 3, 7, 13, 64, 4096] {
+                for window in [64, 128, 1024, DEFAULT_WINDOW_BYTES] {
+                    let actual = drive_stream(&data, limit, window).unwrap_or_else(|error| {
+                        panic!("{shape:?}, limit {limit}, window {window}: {error}")
+                    });
+                    assert_eq!(
+                        actual.output, expected.output,
+                        "{shape:?}, limit {limit}, window {window}: output diverged"
+                    );
+                    assert_eq!(actual.records, expected.records, "{shape:?}");
+                }
             }
         }
     }
 
     #[test]
     fn stream_matches_slice_for_fasta() {
-        let data = sample_fasta(30);
-        let expected = drive_bytes(&data).unwrap();
-        assert_eq!(expected.records, 30);
+        for shape in fixtures::ALL
+            .into_iter()
+            .filter(|shape| shape.format == SequenceFormat::Fasta)
+        {
+            let count = fixtures::count_within(shape, 4 << 10);
+            let data = fixtures::records(shape, count);
+            let expected = drive_bytes(&data).unwrap();
+            assert_eq!(expected.records, count, "{shape:?}");
 
-        for limit in [1, 5, 11, 64, 4096] {
-            for window in [64, 256, DEFAULT_WINDOW_BYTES] {
-                let actual = drive_stream(&data, limit, window)
-                    .unwrap_or_else(|error| panic!("limit {limit}, window {window}: {error}"));
-                assert_eq!(
-                    actual.output, expected.output,
-                    "limit {limit}, window {window}: output diverged"
-                );
+            for limit in [1, 5, 11, 64, 4096] {
+                for window in [64, 256, DEFAULT_WINDOW_BYTES] {
+                    let actual = drive_stream(&data, limit, window).unwrap_or_else(|error| {
+                        panic!("{shape:?}, limit {limit}, window {window}: {error}")
+                    });
+                    assert_eq!(
+                        actual.output, expected.output,
+                        "{shape:?}, limit {limit}, window {window}: output diverged"
+                    );
+                }
             }
         }
     }
@@ -834,18 +879,15 @@ mod tests {
     /// A record larger than the initial window must grow it, not stall or truncate.
     #[test]
     fn record_larger_than_window_grows_it() {
-        let mut data = Vec::from(&b"@long\n"[..]);
-        data.extend(std::iter::repeat_n(b'A', 5000));
-        data.extend_from_slice(b"\n+\n");
-        data.extend(std::iter::repeat_n(b'I', 5000));
-        data.push(b'\n');
+        let shape = fixtures::FOUR_KILOBASE_FASTQ;
+        let data = fixtures::records(shape, 1);
 
         let sink = drive_stream(&data, 17, 64).unwrap();
         assert_eq!(sink.records, 1);
         assert!(sink
             .output
-            .windows(5000)
-            .any(|w| w.iter().all(|&b| b == b'A')));
+            .windows(shape.read_bases)
+            .any(|window| window.iter().all(|&byte| byte == b'A')));
     }
 
     #[test]
@@ -882,7 +924,7 @@ mod tests {
 
     #[test]
     fn format_detection_feeds_the_driver() {
-        let data = sample_fasta(3);
+        let data = fixtures::records(fixtures::WRAPPED_FASTA, 3);
         let format = sequence_format(&data).unwrap().unwrap();
         assert_eq!(format, SequenceFormat::Fasta);
         assert_eq!(drive_bytes(&data).unwrap().records, 3);
@@ -891,7 +933,7 @@ mod tests {
     /// A worker reads through a view while the container stays with its owner.
     #[test]
     fn a_borrowed_view_yields_the_same_records() {
-        let data = sample_fasta(12);
+        let data = fixtures::records(fixtures::WRAPPED_FASTA, 12);
         let owned = RandomAccess::new(data.clone());
         let mut through_view = Vec::new();
         owned
@@ -903,6 +945,87 @@ mod tests {
             .unwrap();
         assert_eq!(through_view.len(), 12);
         assert_eq!(through_view, headers_in(&data));
+    }
+
+    /// One record as owned bytes — header, sequence, quality — so a comparison can outlive
+    /// the window the record borrowed from.
+    type OwnedRecord = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+    /// Every record a window over `data` yields.
+    fn records_within(
+        data: &[u8],
+        window_bytes: usize,
+        start: StreamStart,
+        decoded_bytes: Option<usize>,
+    ) -> io::Result<Vec<OwnedRecord>> {
+        let mut records = Vec::new();
+        ForwardAccess::with_window(data, window_bytes).for_each_record_within(
+            start,
+            decoded_bytes,
+            |record| {
+                records.push((
+                    record.header.to_vec(),
+                    record.sequence.to_vec(),
+                    record.quality.to_vec(),
+                ));
+                Ok(())
+            },
+        )?;
+        Ok(records)
+    }
+
+    /// Two windows split anywhere tile the input: the head keeps the record straddling the
+    /// split, and the tail resumes at the first boundary after it.
+    ///
+    /// This is what a run of blocks does at every block but the first, and it needs no codec
+    /// to reach — a plain buffer cut in two drives the same two entry points. Leaving it to
+    /// the compressed tiers puts the whole of [`StreamStart::FirstBoundary`] behind a feature
+    /// flag, so a build with no codec never runs the code that carried the bug.
+    #[test]
+    fn a_split_buffer_tiles_the_same_records() {
+        for shape in fixtures::ALL {
+            let data = fixtures::records(shape, fixtures::count_within(shape, 4 << 10));
+            let format = shape.format;
+
+            for window_bytes in [64usize, 256, 4096] {
+                let whole = records_within(&data, window_bytes, StreamStart::FirstByte, None)
+                    .unwrap_or_else(|error| {
+                        panic!("{shape:?}, {window_bytes}-byte window: {error}")
+                    });
+                assert!(!whole.is_empty(), "{shape:?}: the fixture holds no records");
+
+                for divisor in [7usize, 3, 2] {
+                    let split = data.len() / divisor;
+                    if split == 0 || split >= data.len() {
+                        continue;
+                    }
+
+                    // The head owns every record beginning before the split, including the one
+                    // straddling it, which is why the budget is consulted before a parse.
+                    let head =
+                        records_within(&data, window_bytes, StreamStart::FirstByte, Some(split))
+                            .unwrap();
+                    // The tail opens mid-record, so it is told the format and skips forward to
+                    // the first boundary rather than parsing the fragment it inherits.
+                    let tail = records_within(
+                        &data[split..],
+                        window_bytes,
+                        StreamStart::FirstBoundary(format),
+                        None,
+                    )
+                    .unwrap();
+
+                    let mut tiled = head;
+                    tiled.extend(tail);
+                    assert_eq!(
+                        tiled,
+                        whole,
+                        "{shape:?}, {window_bytes}-byte window, split at {split} of {}",
+                        data.len()
+                    );
+                }
+            }
+        }
     }
 
     /// Headers of every record in a buffer, as the tier-independent answer to compare against.
@@ -937,7 +1060,8 @@ mod tests {
     #[test]
     fn a_plain_file_opens_as_bytes() {
         let directory = tempfile::tempdir().unwrap();
-        let path = written(&directory, "plain.fasta", &sample_fasta(8));
+        let plain = fixtures::records(fixtures::WRAPPED_FASTA, 8);
+        let path = written(&directory, "plain.fasta", &plain);
         assert!(matches!(
             InputFile::open(Some(path.to_str().unwrap())).unwrap(),
             InputFile::Bytes(_)
@@ -969,7 +1093,7 @@ mod tests {
             .unwrap();
         assert!(created.success(), "mkfifo failed");
 
-        let plain = sample_fasta(4);
+        let plain = fixtures::records(fixtures::WRAPPED_FASTA, 4);
         let expected = headers_in(&plain);
         // Both ends block until the other arrives, so the writer runs alongside the open.
         let written_path = path.clone();
@@ -988,56 +1112,16 @@ mod tests {
         assert_eq!(headers, expected);
     }
 
-    /// One BGZF block over `payload`: gzip magic, a `BC` extra field, raw deflate, trailer.
-    #[cfg(feature = "gzip")]
-    fn bgzf_block(payload: &[u8]) -> Vec<u8> {
-        let mut deflated = Vec::with_capacity(payload.len() + 64);
-        let mut compress = flate2::Compress::new(flate2::Compression::fast(), false);
-        compress
-            .compress_vec(payload, &mut deflated, flate2::FlushCompress::Finish)
-            .unwrap();
-        let mut checksum = flate2::Crc::new();
-        checksum.update(payload);
-
-        let size = 12 + 6 + deflated.len() + 8;
-        let mut block = vec![0x1f, 0x8b, 0x08, 0x04, 0, 0, 0, 0, 0, 0xff, 6, 0];
-        block.extend_from_slice(b"BC");
-        block.extend_from_slice(&2u16.to_le_bytes());
-        block.extend_from_slice(&((size - 1) as u16).to_le_bytes());
-        block.extend_from_slice(&deflated);
-        block.extend_from_slice(&checksum.sum().to_le_bytes());
-        block.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        block
-    }
-
-    /// `plain` as BGZF, in blocks small enough that records straddle them.
-    #[cfg(feature = "gzip")]
-    fn bgzf_bytes(plain: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for chunk in plain.chunks(512) {
-            out.extend_from_slice(&bgzf_block(chunk));
-        }
-        out.extend_from_slice(&bgzf_block(b""));
-        out
-    }
-
-    /// `plain` as one plain gzip member, which carries no block layout.
-    #[cfg(feature = "gzip")]
-    fn gzip_bytes(plain: &[u8]) -> Vec<u8> {
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        std::io::Write::write_all(&mut encoder, plain).unwrap();
-        encoder.finish().unwrap()
-    }
-
     /// BGZF on a regular file stays block-addressable, which is why the tier exists.
     #[cfg(feature = "gzip")]
     #[test]
     fn a_bgzip_file_opens_as_blocks() {
         let directory = tempfile::tempdir().unwrap();
+        let plain = fixtures::records(fixtures::WRAPPED_FASTA, 8);
         let path = written(
             &directory,
             "blocked.fasta.gz",
-            &bgzf_bytes(&sample_fasta(8)),
+            &fixtures::bgzf_bytes(&plain, 512),
         );
         assert!(matches!(
             InputFile::open(Some(path.to_str().unwrap())).unwrap(),
@@ -1051,10 +1135,11 @@ mod tests {
     #[test]
     fn a_plain_gzip_file_opens_as_stream() {
         let directory = tempfile::tempdir().unwrap();
+        let plain = fixtures::records(fixtures::WRAPPED_FASTA, 8);
         let path = written(
             &directory,
             "streamed.fasta.gz",
-            &gzip_bytes(&sample_fasta(8)),
+            &fixtures::gzip_bytes(&plain),
         );
         assert!(matches!(
             InputFile::open(Some(path.to_str().unwrap())).unwrap(),
@@ -1064,23 +1149,163 @@ mod tests {
     }
 
     /// The tier is an implementation detail, so all three shapes of the same file must yield
-    /// exactly the same records.
+    /// exactly the same records — at every point of the input space.
     #[cfg(feature = "gzip")]
     #[test]
     fn every_input_shape_yields_the_same_records() {
-        let plain = sample_fasta(64);
-        let directory = tempfile::tempdir().unwrap();
-        let expected = records_at(&written(&directory, "plain.fasta", &plain)).unwrap();
-        assert_eq!(expected.len(), 64);
+        for shape in fixtures::ALL {
+            let count = fixtures::count_within(shape, 8 << 10);
+            let plain = fixtures::records(shape, count);
+            let directory = tempfile::tempdir().unwrap();
+            let expected = records_at(&written(&directory, "plain", &plain)).unwrap();
+            assert_eq!(expected.len(), count, "{shape:?}");
 
-        let blocked = written(&directory, "blocked.fasta.gz", &bgzf_bytes(&plain));
-        assert_eq!(records_at(&blocked).unwrap(), expected, "blocked diverged");
+            let blocked = written(&directory, "blocked.gz", &fixtures::bgzf_bytes(&plain, 512));
+            assert_eq!(
+                records_at(&blocked).unwrap(),
+                expected,
+                "{shape:?}: blocked diverged"
+            );
 
-        let streamed = written(&directory, "streamed.fasta.gz", &gzip_bytes(&plain));
+            let streamed = written(&directory, "streamed.gz", &fixtures::gzip_bytes(&plain));
+            assert_eq!(
+                records_at(&streamed).unwrap(),
+                expected,
+                "{shape:?}: streamed diverged"
+            );
+        }
+    }
+
+    /// One record written under `rendering`, as the bytes a sink would receive.
+    fn rendered(rendering: Rendering, sequence: &[u8], quality: &[u8]) -> Vec<u8> {
+        let mut writer = RecordWriter::with_rendering(Vec::new(), rendering, SequenceFormat::Fastq);
+        writer
+            .write_parts(b"read0 sample", sequence, quality)
+            .unwrap();
+        writer.into_inner()
+    }
+
+    /// Every escape sequence dropped, leaving the bytes a pipe would have received.
+    fn without_escapes(rendered: &[u8]) -> Vec<u8> {
+        let mut plain = Vec::with_capacity(rendered.len());
+        let mut rest = rendered;
+        while let Some(escape) = rest.iter().position(|&byte| byte == 0x1b) {
+            plain.extend_from_slice(&rest[..escape]);
+            let end = rest[escape..]
+                .iter()
+                .position(|&byte| byte == b'm')
+                .expect("an escape sequence ends in 'm'");
+            rest = &rest[escape + end + 1..];
+        }
+        plain.extend_from_slice(rest);
+        plain
+    }
+
+    /// A terminal gets the sequence wrapped and coloured, and colour is purely additive.
+    ///
+    /// The escape-stripped bytes must be the wrapped-but-uncoloured rendering exactly, so a
+    /// colour run can neither swallow a base nor emit one twice, and quality carries no colour
+    /// at all because its bytes are scores rather than bases.
+    #[test]
+    fn a_terminal_gets_a_wrapped_and_coloured_record() {
         assert_eq!(
-            records_at(&streamed).unwrap(),
-            expected,
-            "streamed diverged"
+            Rendering::TERMINAL,
+            Rendering {
+                line_width: 60,
+                color: true
+            }
         );
+        assert_eq!(
+            Rendering::PLAIN,
+            Rendering {
+                line_width: 0,
+                color: false
+            }
+        );
+
+        // 155 bases, so the wrap lands three lines deep with a short last one, and every
+        // colour the table knows appears alongside a base it leaves uncoloured.
+        let sequence: Vec<u8> = b"ACGTNX".iter().copied().cycle().take(155).collect();
+        let quality = vec![b'I'; 155];
+
+        let terminal = rendered(Rendering::TERMINAL, &sequence, &quality);
+        let uncoloured = rendered(
+            Rendering {
+                line_width: 60,
+                color: false,
+            },
+            &sequence,
+            &quality,
+        );
+        assert_eq!(
+            without_escapes(&terminal),
+            uncoloured,
+            "colour must add escapes and change nothing else"
+        );
+
+        // Green, blue, yellow, red and grey, one per base the table names.
+        for escape in [
+            &b"\x1b[32m"[..],
+            b"\x1b[34m",
+            b"\x1b[33m",
+            b"\x1b[31m",
+            b"\x1b[90m",
+        ] {
+            assert!(
+                terminal.windows(escape.len()).any(|found| found == escape),
+                "missing the colour {escape:?}"
+            );
+        }
+
+        // Header, three sequence lines, the separator, three quality lines.
+        let lines: Vec<&[u8]> = uncoloured.split(|&byte| byte == b'\n').collect();
+        assert_eq!(lines.len(), 9, "trailing empty piece included");
+        assert_eq!(lines[0], b"@read0 sample");
+        assert_eq!(
+            [lines[1].len(), lines[2].len(), lines[3].len()],
+            [60, 60, 35]
+        );
+        assert_eq!(lines[4], b"+");
+        assert_eq!(
+            [lines[5].len(), lines[6].len(), lines[7].len()],
+            [60, 60, 35]
+        );
+
+        // Quality is scores, so it wraps with the sequence and is never coloured.
+        let separator = terminal
+            .windows(3)
+            .position(|found| found == b"\n+\n")
+            .expect("a FASTQ record carries a separator");
+        assert!(
+            !terminal[separator..].contains(&0x1b),
+            "quality must carry no colour"
+        );
+
+        // A pipe gets one line per sequence and no escape at all.
+        let plain = rendered(Rendering::PLAIN, &sequence, &quality);
+        assert!(!plain.contains(&0x1b));
+        assert_eq!(plain.split(|&byte| byte == b'\n').count(), 5);
+    }
+
+    /// One output stream carries one format, so the first record settles it and a later
+    /// disagreement is an error rather than a silently mixed file.
+    #[test]
+    fn adopting_a_second_format_is_refused() {
+        let mut writer = RecordWriter::new(Vec::new(), SequenceFormat::Fasta);
+        writer.adopt(SequenceFormat::Fastq).unwrap();
+        // Idempotent, so a tool calls it per record rather than needing a hook before them.
+        writer.adopt(SequenceFormat::Fastq).unwrap();
+
+        let error = writer.adopt(SequenceFormat::Fasta).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(
+            message.contains("Fasta") && message.contains("Fastq"),
+            "{message}"
+        );
+
+        // The refusal leaves the settled format in place rather than half-applying the second.
+        writer.write_parts(b"read0", b"ACGT", b"IIII").unwrap();
+        assert_eq!(writer.into_inner(), b"@read0\nACGT\n+\nIIII\n");
     }
 }

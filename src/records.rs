@@ -1,4 +1,4 @@
-//! Faster FASTA — what a record is, and the one parser that reads them.
+//! What a record is, and the one parser that reads them.
 //!
 //! Two regions:
 //!
@@ -11,9 +11,10 @@
 //!   filled stream window, and a byte range handed to one worker, which is why there is no
 //!   second parser anywhere in this crate.
 //!
-//! This is the lowest layer of the crate.
-//! Everything here is pure: no file is opened, no thread is spawned, no byte range is chosen,
-//! and no sibling module is declared.
+//! Everything here is pure: no file is opened, no thread is spawned, and no byte range is
+//! chosen.
+//! The one layer it reaches for is [`crate::codecs`], asked to name the container behind a
+//! first byte that opens neither format, so the error says "gzip" rather than "expected '@'".
 //! The shapes an input can arrive in live one level up, in [`crate::files`].
 
 use std::io;
@@ -86,13 +87,10 @@ impl<'a> Record<'a> {
     /// mate number after the first blank and are unaffected.
     pub fn identifier(&self) -> &'a [u8] {
         let without_sigil = self.header_without_sigil();
-        let field = match find_byteset(without_sigil, FIELD_SEPARATORS) {
-            Some(position) => &without_sigil[..position],
-            None => without_sigil,
-        };
-        match field {
+        let end = find_byteset(without_sigil, FIELD_SEPARATORS).unwrap_or(without_sigil.len());
+        match &without_sigil[..end] {
             [head @ .., b'/', b'1' | b'2'] => head,
-            _ => field,
+            field => field,
         }
     }
 }
@@ -137,33 +135,45 @@ const WHITESPACE: Byteset = Byteset::from_bytes(b" \t\r\n");
 /// record still composes into the next tool in a pipeline. Only a first byte that opens
 /// neither format is an error.
 pub fn sequence_format(data: &[u8]) -> io::Result<Option<SequenceFormat>> {
-    for &byte in data.iter() {
-        match byte {
-            b' ' | b'\t' | b'\r' | b'\n' => continue,
-            b'@' => return Ok(Some(SequenceFormat::Fastq)),
-            b'>' => return Ok(Some(SequenceFormat::Fasta)),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    match crate::codecs::Codec::detect(data) {
-                        crate::codecs::Codec::Plain => {
-                            format!(
-                                "unknown format: expected '@' or '>', found {:?}",
-                                byte as char
-                            )
-                        }
-                        // Only one container is peeled, deliberately: a second layer is far
-                        // more often a mistake than an intention.
-                        codec => format!(
-                            "input is compressed with {}, not FASTA or FASTQ",
-                            codec.name()
-                        ),
-                    },
-                ));
-            }
-        }
+    // Spelled out rather than `is_ascii_whitespace`, which also accepts a form feed and a
+    // vertical tab: neither opens a record, and neither may be skipped over to reach one.
+    let blank = |byte: u8| matches!(byte, b' ' | b'\t' | b'\r' | b'\n');
+    let Some(&byte) = data.iter().find(|&&byte| !blank(byte)) else {
+        return Ok(None);
+    };
+    match byte {
+        b'@' => Ok(Some(SequenceFormat::Fastq)),
+        b'>' => Ok(Some(SequenceFormat::Fasta)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            match crate::codecs::Codec::detect(data) {
+                crate::codecs::Codec::Plain => format!(
+                    "unknown format: expected '@' or '>', found {:?}",
+                    byte as char
+                ),
+                // Only one container is peeled, deliberately: a second layer is far more
+                // often a mistake than an intention.
+                codec => format!(
+                    "input is compressed with {}, not FASTA or FASTQ",
+                    codec.name()
+                ),
+            },
+        )),
     }
-    Ok(None)
+}
+
+/// Refuse `flag` when the input carries no per-base quality for it to read.
+///
+/// A FASTA record has no quality, so a quality flag would silently pass or reject every record
+/// and exit successfully. Saying so is the only honest answer.
+pub fn needs_fastq(flag: &str, format: SequenceFormat) -> io::Result<()> {
+    match format {
+        SequenceFormat::Fastq => Ok(()),
+        SequenceFormat::Fasta => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{flag} needs FASTQ input, but this input is FASTA"),
+        )),
+    }
 }
 
 /// ASCII quality character to Phred score, Phred+33 as used by Illumina 1.8 and later.
@@ -201,18 +211,61 @@ pub enum RecordKey {
     Sequence,
 }
 
+/// Complement table over the full IUPAC nucleotide alphabet, in both cases.
+///
+/// Anything outside the alphabet maps to itself, so unexpected bytes survive a round trip
+/// rather than being silently rewritten.
+pub fn complement_table() -> [u8; 256] {
+    let mut table: [u8; 256] = core::array::from_fn(|index| index as u8);
+
+    // Uracil is its own pair with adenine so RNA is an involution: complementing A back to T
+    // instead of U would silently transcribe RNA into DNA.
+    const PAIRS: &[(u8, u8)] = &[
+        (b'A', b'T'),
+        (b'T', b'A'),
+        (b'U', b'A'),
+        (b'G', b'C'),
+        (b'C', b'G'),
+        // Ambiguity codes: each maps to the complement of its base set.
+        (b'R', b'Y'), // A/G  -> T/C
+        (b'Y', b'R'),
+        (b'S', b'S'), // G/C is self-complementary
+        (b'W', b'W'), // A/T is self-complementary
+        (b'K', b'M'), // G/T  -> C/A
+        (b'M', b'K'),
+        (b'B', b'V'), // not-A -> not-T
+        (b'V', b'B'),
+        (b'D', b'H'), // not-C -> not-G
+        (b'H', b'D'),
+        (b'N', b'N'),
+    ];
+
+    for &(base, complement) in PAIRS {
+        table[base as usize] = complement;
+        table[base.to_ascii_lowercase() as usize] = complement.to_ascii_lowercase();
+    }
+    table
+}
+
+/// The bytes a record is identified by, borrowed from the record itself.
+///
+/// Deduplication compares these bytes when two records collide under [`digest`], so the two
+/// must agree on what a key is; naming the selection once is what guarantees they do.
+pub fn key_bytes<'a>(record: &Record<'a>, key: RecordKey) -> &'a [u8] {
+    match key {
+        RecordKey::Identifier => record.identifier(),
+        RecordKey::Header => record.header_without_sigil(),
+        RecordKey::Sequence => record.sequence,
+    }
+}
+
 /// Seeded 64-bit digest of one record field.
 ///
 /// Pure, so the same record yields the same digest whatever its position in the input, how
 /// the inputs were ordered, or how many workers ran. That is what lets sampling and
 /// deduplication run wide without changing their answers.
 pub fn digest(record: &Record<'_>, key: RecordKey, seed: u64) -> u64 {
-    let bytes = match key {
-        RecordKey::Identifier => record.identifier(),
-        RecordKey::Header => record.header_without_sigil(),
-        RecordKey::Sequence => record.sequence,
-    };
-    hash_with_seed(bytes, seed)
+    hash_with_seed(key_bytes(record, key), seed)
 }
 
 // endregion: Records
@@ -531,14 +584,20 @@ enum CycleProof {
 fn fastq_cycle(bytes: &[u8], candidate: usize) -> CycleProof {
     let mut cursor = candidate;
     let mut lines = [0usize; 4];
-    for slot in lines.iter_mut() {
+    // Where the third line begins, taken from the walk rather than rebuilt from the lengths.
+    // The lengths exclude a carriage return, so adding one byte per terminator lands two short
+    // of the separator on a CRLF file and no candidate is ever provable.
+    let mut separator = candidate;
+    for (index, slot) in lines.iter_mut().enumerate() {
         let Some(end) = find_line_end(bytes, cursor) else {
             return CycleProof::Truncated;
         };
         *slot = length_without_carriage_return(&bytes[cursor..end]);
         cursor = end + 1;
+        if index == 1 {
+            separator = cursor;
+        }
     }
-    let separator = candidate + lines[0] + 1 + lines[1] + 1;
     match bytes.get(separator) {
         None => CycleProof::Truncated,
         Some(&byte) if byte == b'+' && lines[1] == lines[3] => CycleProof::Holds,
@@ -553,7 +612,7 @@ fn cycle_holds(bytes: &[u8], candidate: usize, format: SequenceFormat) -> bool {
 
 /// Where a boundary search over a buffer that may still grow has got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecordStart {
+pub enum RecordBoundary {
     /// A record begins at this offset.
     At(usize),
     /// A candidate here outran the buffer. A caller that can append must search again from
@@ -568,7 +627,7 @@ pub enum RecordStart {
 /// A four-line FASTQ cycle is tens of kilobytes on a long read, so a candidate near the end of
 /// a parse window is undecided rather than rejected. Reporting the two alike is what makes a
 /// streaming caller step past a boundary and drop every record up to the next one.
-pub fn next_record_start(bytes: &[u8], from: usize, format: SequenceFormat) -> RecordStart {
+pub fn first_record_boundary(bytes: &[u8], from: usize, format: SequenceFormat) -> RecordBoundary {
     let sigil = format.sigil();
     let mut undecided = None;
 
@@ -577,9 +636,9 @@ pub fn next_record_start(bytes: &[u8], from: usize, format: SequenceFormat) -> R
     // accepting it unproven would parse the previous worker's straddling record a second time.
     if from == 0 && bytes.first() == Some(&sigil) {
         match format {
-            SequenceFormat::Fasta => return RecordStart::At(0),
+            SequenceFormat::Fasta => return RecordBoundary::At(0),
             SequenceFormat::Fastq => match fastq_cycle(bytes, 0) {
-                CycleProof::Holds => return RecordStart::At(0),
+                CycleProof::Holds => return RecordBoundary::At(0),
                 CycleProof::Fails => {}
                 CycleProof::Truncated => undecided = Some(0),
             },
@@ -600,9 +659,9 @@ pub fn next_record_start(bytes: &[u8], from: usize, format: SequenceFormat) -> R
             break;
         }
         match format {
-            SequenceFormat::Fasta => return RecordStart::At(candidate),
+            SequenceFormat::Fasta => return RecordBoundary::At(candidate),
             SequenceFormat::Fastq => match fastq_cycle(bytes, candidate) {
-                CycleProof::Holds => return RecordStart::At(candidate),
+                CycleProof::Holds => return RecordBoundary::At(candidate),
                 CycleProof::Fails => {}
                 CycleProof::Truncated => undecided = undecided.or(Some(candidate - 1)),
             },
@@ -611,19 +670,8 @@ pub fn next_record_start(bytes: &[u8], from: usize, format: SequenceFormat) -> R
     }
 
     match undecided {
-        Some(resume_from) => RecordStart::Undecided(resume_from),
-        None => RecordStart::NotFound,
-    }
-}
-
-/// First record boundary at or after `from`, over bytes that are all the bytes there are.
-///
-/// Records wrapped across several lines cannot be resynchronized this way and are only safe
-/// to read from the start of the input.
-pub fn next_record_boundary(bytes: &[u8], from: usize, format: SequenceFormat) -> Option<usize> {
-    match next_record_start(bytes, from, format) {
-        RecordStart::At(boundary) => Some(boundary),
-        RecordStart::Undecided(_) | RecordStart::NotFound => None,
+        Some(resume_from) => RecordBoundary::Undecided(resume_from),
+        None => RecordBoundary::NotFound,
     }
 }
 
@@ -658,6 +706,8 @@ pub fn last_record_boundary(bytes: &[u8], format: SequenceFormat) -> Option<usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::fixtures;
 
     #[test]
     fn detects_both_formats() {
@@ -854,27 +904,38 @@ mod tests {
 
     #[test]
     fn fastq_crlf_is_handled() {
-        let records = parse_all(b"@seq1\r\nACGT\r\n+\r\nIIII\r\n", SequenceFormat::Fastq).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].0, b"@seq1");
-        assert_eq!(records[0].1, b"ACGT");
-        assert_eq!(records[0].2, b"IIII");
+        let data = fixtures::records(fixtures::CARRIAGE_RETURN_FASTQ, 3);
+        let records = parse_all(&data, SequenceFormat::Fastq).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].0, b"@read0 sample");
+        assert_eq!(records[0].1, b"AAAAAAAA");
+        assert_eq!(records[0].2, b"IIIIIIII");
+        assert_eq!(records[2].1.len(), records[2].2.len());
     }
 
     /// Every prefix of a valid input must be `Incomplete`, never `Invalid`. This is the
     /// property the whole driver depends on.
+    ///
+    /// One record per shape, so every proper prefix really is short of a whole one. The two
+    /// 20 kb shapes are left out because the sweep is quadratic in the fixture and they prove
+    /// nothing the 4 kb shape does not.
     #[test]
     fn every_prefix_is_incomplete_not_invalid() {
-        let data = b"@seq1\nACGT\n+\nIIII\n";
         let mut scratch = RecordScratch::new();
-        for length in 1..data.len() {
-            match parse_leading_fastq_record(&data[..length], false, &mut scratch) {
-                ParseOutcome::Incomplete => {}
-                ParseOutcome::Record(..) => {
-                    panic!("prefix of {length} bytes parsed as a full record")
-                }
-                ParseOutcome::Invalid(error) => {
-                    panic!("prefix of {length} bytes reported as invalid: {error}")
+        for shape in fixtures::ALL
+            .into_iter()
+            .filter(|shape| shape.read_bases < 8192)
+        {
+            let data = fixtures::records(shape, 1);
+            for length in 1..data.len() {
+                match parse_leading_record(&data[..length], shape.format, false, &mut scratch) {
+                    ParseOutcome::Incomplete => {}
+                    ParseOutcome::Record(..) => {
+                        panic!("{shape:?}: prefix of {length} bytes parsed as a full record")
+                    }
+                    ParseOutcome::Invalid(error) => {
+                        panic!("{shape:?}: prefix of {length} bytes reported as invalid: {error}")
+                    }
                 }
             }
         }
@@ -916,50 +977,84 @@ mod tests {
 
     /// A FASTQ quality line may open with '@', so a naive boundary search lands mid-record.
     #[test]
-    fn next_record_boundary_rejects_fastq_quality_opening_with_at() {
-        // Quality '@' is Phred 31, entirely legal, and here it opens the fourth line.
-        let data = b"@read0\nACGT\n+\n@III\n@read1\nTGCA\n+\nIIII\n".to_vec();
-        let boundary = next_record_boundary(&data, 1, SequenceFormat::Fastq).unwrap();
+    fn first_record_boundary_rejects_fastq_quality_opening_with_at() {
+        // Quality '@' is Phred 31, entirely legal, and here it opens every fourth line.
+        let data = fixtures::records(fixtures::SIGIL_QUALITY_FASTQ, 2);
+        let RecordBoundary::At(boundary) = first_record_boundary(&data, 1, SequenceFormat::Fastq)
+        else {
+            panic!("the second record must be provable")
+        };
         assert_eq!(&data[boundary..boundary + 6], b"@read1");
     }
 
     #[test]
-    fn next_record_boundary_finds_the_next_fasta_record() {
+    fn first_record_boundary_finds_the_next_fasta_record() {
         let data = b">a\nACGT\n>b\nTGCA\n";
         assert_eq!(
-            next_record_boundary(data, 0, SequenceFormat::Fasta),
-            Some(0)
+            first_record_boundary(data, 0, SequenceFormat::Fasta),
+            RecordBoundary::At(0)
         );
         assert_eq!(
-            next_record_boundary(data, 1, SequenceFormat::Fasta),
-            Some(8)
+            first_record_boundary(data, 1, SequenceFormat::Fasta),
+            RecordBoundary::At(8)
         );
     }
 
-    /// A four-line proof cut short by the end of the buffer is undecided, not rejected.
+    /// A four-line proof cut short by the end of the buffer is undecided, and the offset it
+    /// reports is one a rescan can still find the same boundary from.
     ///
     /// Long reads make this the common case: a cycle spans tens of kilobytes, so a candidate
-    /// near the end of a parse window cannot be proven yet. Reporting it as rejected made a
-    /// streaming caller resume past it and silently drop every record up to the next one.
+    /// near the end of a parse window cannot be proven yet. The boundary is a two-byte needle,
+    /// a newline and a sigil, so resuming at the sigil rather than at the newline steps over
+    /// the very match the rescan exists to find and drops every record up to the next one.
+    /// Asserting only that the offset does not overshoot the boundary tolerates exactly that.
     #[test]
-    fn a_cycle_cut_short_is_undecided_rather_than_rejected() {
-        let first = "@read0\nACGTACGT\n+\nIIIIIIII\n";
-        let whole = format!("{first}@read1\nTGCA\n+\nIIII\n").into_bytes();
-        let whole = whole.as_slice();
-        let boundary = first.len();
-        assert_eq!(
-            next_record_start(whole, 1, SequenceFormat::Fastq),
-            RecordStart::At(boundary)
-        );
+    fn a_rescan_from_an_undecided_offset_finds_the_same_boundary() {
+        for shape in fixtures::ALL {
+            let data = fixtures::records(shape, fixtures::count_within(shape, 2 << 10));
+            let format = shape.format;
+            // Bounded, so a twenty-kilobase shape samples its length instead of walking every
+            // offset of it.
+            let stride = data.len().div_ceil(512).max(1);
 
-        // The same bytes, stopping one short of the fourth line of the second record.
-        let truncated = &whole[..whole.len() - 1];
-        match next_record_start(truncated, 1, SequenceFormat::Fastq) {
-            RecordStart::Undecided(resume_from) => assert!(
-                resume_from <= boundary,
-                "a rescan from {resume_from} would step over the boundary at {boundary}"
-            ),
-            found => panic!("an unprovable candidate must not be reported as {found:?}"),
+            for from in [0usize, 1] {
+                let reference = first_record_boundary(&data, from, format);
+                let RecordBoundary::At(_) = reference else {
+                    panic!("{shape:?}: the whole buffer must decide a boundary, got {reference:?}");
+                };
+
+                let mut undecided_count = 0usize;
+                for cut in (1..data.len()).step_by(stride) {
+                    match first_record_boundary(&data[..cut], from, format) {
+                        // A candidate proven inside a prefix stays proven, and it is still the
+                        // first one, so more bytes may not move it.
+                        decided @ RecordBoundary::At(_) => assert_eq!(
+                            decided, reference,
+                            "{shape:?} from {from}: the boundary proven within {cut} bytes \
+                             moved once the rest of the buffer arrived"
+                        ),
+                        RecordBoundary::Undecided(resume_from) => {
+                            undecided_count += 1;
+                            assert_eq!(
+                                first_record_boundary(&data, resume_from, format),
+                                reference,
+                                "{shape:?} from {from}: cut at {cut}, a rescan resuming at \
+                                 {resume_from} no longer finds the boundary"
+                            );
+                        }
+                        RecordBoundary::NotFound => {}
+                    }
+                }
+
+                // FASTA needs no proof, so only FASTQ can leave a candidate undecided, and a
+                // property over an outcome that never occurs proves nothing.
+                if format == SequenceFormat::Fastq {
+                    assert!(
+                        undecided_count > 0,
+                        "{shape:?} from {from}: no truncation left a candidate unproven"
+                    );
+                }
+            }
         }
     }
 
@@ -970,15 +1065,18 @@ mod tests {
         let before = "@read0\nACGT\n+\n@III\n";
         let data = format!("{before}@read1\nTGCA\n+\nIIII\n").into_bytes();
         assert_eq!(
-            next_record_start(&data, 1, SequenceFormat::Fastq),
-            RecordStart::At(before.len())
+            first_record_boundary(&data, 1, SequenceFormat::Fastq),
+            RecordBoundary::At(before.len())
         );
     }
 
     #[test]
-    fn next_record_boundary_returns_none_past_the_end() {
+    fn first_record_boundary_returns_none_past_the_end() {
         let data = b">a\nACGT\n";
-        assert_eq!(next_record_boundary(data, 3, SequenceFormat::Fasta), None);
+        assert_eq!(
+            first_record_boundary(data, 3, SequenceFormat::Fasta),
+            RecordBoundary::NotFound
+        );
     }
 
     #[test]
@@ -1001,8 +1099,8 @@ mod tests {
     /// from a header.
     #[test]
     fn last_record_boundary_rejects_fastq_quality_opening_with_at() {
-        let data = b"@read0\nACGT\n+\nIIII\n@read1\nTGCA\n+\n@III\n";
-        let boundary = last_record_boundary(data, SequenceFormat::Fastq).unwrap();
+        let data = fixtures::records(fixtures::SIGIL_QUALITY_FASTQ, 2);
+        let boundary = last_record_boundary(&data, SequenceFormat::Fastq).unwrap();
         assert_eq!(&data[boundary..boundary + 6], b"@read1");
     }
 

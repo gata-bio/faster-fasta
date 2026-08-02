@@ -1,4 +1,4 @@
-//! Faster FASTA — command-line utilities over memory-mapped and streamed sequence files.
+//! Command-line utilities over memory-mapped and streamed sequence files.
 //!
 //! Five modules, in dependency order:
 //!
@@ -22,3 +22,8 @@ pub mod blocks;
 pub mod files;
 pub mod records;
 pub mod scheduling;
+
+// The fixture inputs every test module reads, shared so no axis stays pinned at the one value
+// a hand-rolled helper happened to choose.
+#[cfg(test)]
+mod fixtures;

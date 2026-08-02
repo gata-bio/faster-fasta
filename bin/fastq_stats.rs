@@ -76,8 +76,7 @@ impl Summary {
     fn merge(&mut self, other: &Summary) {
         // A total row over mixed formats has no single format to report.
         self.format = match (self.format, other.format) {
-            (None, found) => found,
-            (found, None) => found,
+            (None, found) | (found, None) => found,
             (first, second) if first == second => first,
             _ => None,
         };
@@ -101,12 +100,9 @@ impl Summary {
         }
     }
 
+    /// Flooring the divisor at one is exact here: no records means no bases either.
     fn mean_length(&self) -> f64 {
-        if self.records == 0 {
-            0.0
-        } else {
-            self.bases as f64 / self.records as f64
-        }
+        self.bases as f64 / self.records.max(1) as f64
     }
 
     /// Mean Phred score, or `None` for FASTA, which carries no quality to average.
@@ -119,12 +115,9 @@ impl Summary {
         }
     }
 
+    /// Flooring the divisor at one is exact here: no bases means nothing was counted either.
     fn percentage(&self, count: u64) -> f64 {
-        if self.bases == 0 {
-            0.0
-        } else {
-            100.0 * count as f64 / self.bases as f64
-        }
+        100.0 * count as f64 / self.bases.max(1) as f64
     }
 
     fn format_name(&self) -> &'static str {
@@ -161,10 +154,7 @@ fn write_histogram(output: &mut impl Write, summary: &Summary) -> io::Result<()>
 
     writeln!(output)?;
     writeln!(output, "Length Distribution")?;
-    for (index, &count) in bins.iter().enumerate() {
-        if count == 0 {
-            continue;
-        }
+    for (index, &count) in bins.iter().enumerate().filter(|(_, &count)| count > 0) {
         let start = low + index * width;
         let end = (start + width - 1).min(high);
         let bar = "█".repeat((40 * count / peak) as usize);
@@ -266,36 +256,34 @@ struct Args {
     parallelism: Parallelism,
 }
 
+fn run(args: &Args) -> io::Result<()> {
+    let mut output = open_output(args.output.as_deref())?;
+    let mut workers = args.parallelism.unordered()?;
+    let mut combined = Summary::new();
+
+    write_header(&mut output)?;
+    for path in &args.inputs {
+        let summary = summarize(path, &mut workers)?;
+        let label = if path == "-" {
+            "(stdin)"
+        } else {
+            path.as_str()
+        };
+        write_row(&mut output, label, &summary)?;
+        combined.merge(&summary);
+    }
+
+    if args.total && args.inputs.len() > 1 {
+        write_row(&mut output, "(total)", &combined)?;
+    }
+    if args.histogram {
+        write_histogram(&mut output, &combined)?;
+    }
+    output.flush()
+}
+
 fn main() {
-    let args = Args::parse();
-
-    let result = (|| -> io::Result<()> {
-        let mut output = open_output(args.output.as_deref())?;
-        let mut workers = args.parallelism.unordered()?;
-        let mut combined = Summary::new();
-
-        write_header(&mut output)?;
-        for path in &args.inputs {
-            let summary = summarize(path, &mut workers)?;
-            let label = if path == "-" {
-                "(stdin)"
-            } else {
-                path.as_str()
-            };
-            write_row(&mut output, label, &summary)?;
-            combined.merge(&summary);
-        }
-
-        if args.total && args.inputs.len() > 1 {
-            write_row(&mut output, "(total)", &combined)?;
-        }
-        if args.histogram {
-            write_histogram(&mut output, &combined)?;
-        }
-        output.flush()
-    })();
-
-    finish_or_exit("Error computing statistics", result);
+    finish_or_exit("Error computing statistics", run(&Args::parse()));
 }
 
 #[cfg(test)]

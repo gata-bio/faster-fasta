@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+#
+# FasterFASTA commit-msg hook - keeps commit messages free of tool attributions and session links,
+# and holds the subject line to the four sanctioned verbs.
+# Install once per clone with:  git config core.hooksPath .githooks
+# Bypass in a genuine emergency with:  git commit --no-verify
+
+set -u
+LC_ALL=C # Byte-wise regexes, immune to the committer's locale
+
+message_file="$1"
+
+# Tool attributions and session links. A commit trailer names a person who can answer a question
+# about the change; an assistant cannot, and a session link points at a transcript nobody outside
+# this machine can open. Both add permanent noise to a log that is read for years.
+attributions=$(grep -inE \
+    '(co-authored-by:.*(claude|anthropic|copilot|chatgpt|openai|gemini|cursor)|generated (with|by).*(claude|copilot|chatgpt|gpt|gemini|cursor|ai)|claude-session|noreply@anthropic\.com|noreply@openai\.com)' \
+    "$message_file" || true)
+if [ -n "$attributions" ]; then
+    echo "commit-msg: tool attributions and session links do not belong in commit messages:" >&2
+    echo "$attributions" >&2
+    echo "Remove the line(s), or bypass with --no-verify only if intentional." >&2
+    exit 1
+fi
+
+# The subject line. Four verbs cover every commit this project accepts: Fix: for a defect, Add: for
+# something that did not exist, Improve: for anything that did exist and got better - a refactor
+# included - and Chore: for housekeeping that rearranges or removes without changing behaviour.
+# A closed set means the log can be skimmed by category, and it forces the author to decide what
+# the commit actually is before writing the body. The word after the verb is uppercase so the
+# subject reads as a sentence. Merge and revert subjects are written by git itself and pass through.
+subject=$(grep -vE '^[[:space:]]*#' "$message_file" | grep -vE '^[[:space:]]*$' | head -n 1)
+if [ -n "$subject" ]; then
+    case "$subject" in
+        Merge* | Revert*) ;;
+        *)
+            if ! printf '%s\n' "$subject" | grep -qE '^(Fix|Improve|Add|Chore): [A-Z]'; then
+                echo "commit-msg: the subject line must start with one of the four sanctioned verbs." >&2
+                echo "  $subject" >&2
+                echo "Write 'Fix: ...' for a defect, 'Add: ...' for something new, 'Improve: ...' for" >&2
+                echo "anything that already existed, 'Chore: ...' for housekeeping - and capitalize the" >&2
+                echo "word that follows the colon." >&2
+                exit 1
+            fi
+            ;;
+    esac
+fi
+
+exit 0

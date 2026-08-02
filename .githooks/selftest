@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+#
+# FasterFASTA git-hook selftest - every check in .githooks/pre-commit and .githooks/commit-msg gets
+# a fixture that must be rejected, and the hooks get fixtures that must pass untouched. A check that
+# stops firing is a rule that silently disappeared; a check that fires on the clean fixture is a
+# rule nobody will keep enabled. Both are failures here.
+#
+# Run with:  .githooks/selftest
+# Fixtures are built in a scratch directory outside the repository. Override its location with
+# FASTERFASTA_SELFTEST_DIR.
+
+set -u
+
+hooks_dir=$(cd "$(dirname "$0")" && pwd)
+scratch_root="${FASTERFASTA_SELFTEST_DIR:-${TMPDIR:-/tmp}/fasterfasta-githooks-selftest}"
+rm -rf "$scratch_root"
+mkdir -p "$scratch_root"
+
+passed=0
+failed=0
+
+# A fixture is a throwaway repository with one empty commit behind it, so `git diff --cached` has a
+# HEAD to compare the staged tree against.
+new_fixture() {
+    local fixture
+    fixture=$(mktemp -d "$scratch_root/fixture.XXXXXX")
+    git -C "$fixture" init -q
+    git -C "$fixture" config user.email "selftest@example.com"
+    git -C "$fixture" config user.name "Selftest"
+    git -C "$fixture" commit -q --allow-empty -m "Add: Baseline"
+    mkdir -p "$fixture/src" "$fixture/bin"
+    printf '%s' "$fixture"
+}
+
+# A minimal Rust test module. Every Rust fixture carries one, so the "exactly one tests module"
+# check does not fire alongside the rule actually under test.
+tests_module() {
+    printf '%s\n' \
+        '#[cfg(test)]' \
+        'mod tests {' \
+        '    #[test]' \
+        '    fn placeholder() {' \
+        '        assert!(1 + 1 == 2);' \
+        '    }' \
+        '}'
+}
+
+run_precommit() {
+    local fixture="$1"
+    (cd "$fixture" && git add -A >/dev/null 2>&1 && "$hooks_dir/pre-commit" 2>&1)
+}
+
+# A rejection is only correct when exactly one check fired and it was the expected one. Counting the
+# checks is what turns this into a false-positive test as well: a fixture that trips two rules means
+# some other check is matching text it has no business matching.
+assert_precommit_rejects() {
+    local title="$1" fixture="$2" expected="$3"
+    local output status count
+    output=$(run_precommit "$fixture")
+    status=$?
+    count=$(printf '%s\n' "$output" | sed -n 's/^pre-commit: \([0-9]*\) check(s) failed.*/\1/p')
+    if [ "$status" -eq 0 ]; then
+        printf 'FAIL  %s: the hook accepted a file that violates the rule\n' "$title"
+        failed=$((failed + 1))
+    elif ! printf '%s\n' "$output" | grep -qF "$expected"; then
+        printf 'FAIL  %s: rejected, but not for the expected reason\n%s\n' "$title" "$output"
+        failed=$((failed + 1))
+    elif [ "$count" != "1" ]; then
+        printf 'FAIL  %s: %s checks fired, expected exactly 1\n%s\n' "$title" "$count" "$output"
+        failed=$((failed + 1))
+    else
+        printf 'ok    %s\n' "$title"
+        passed=$((passed + 1))
+    fi
+}
+
+assert_precommit_accepts() {
+    local title="$1" fixture="$2"
+    local output status
+    output=$(run_precommit "$fixture")
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        printf 'FAIL  %s: the hook rejected a clean tree\n%s\n' "$title" "$output"
+        failed=$((failed + 1))
+    else
+        printf 'ok    %s\n' "$title"
+        passed=$((passed + 1))
+    fi
+}
+
+assert_commit_msg_rejects() {
+    local title="$1" message="$2" expected="$3"
+    local path output status
+    path=$(mktemp "$scratch_root/message.XXXXXX")
+    printf '%s\n' "$message" >"$path"
+    output=$("$hooks_dir/commit-msg" "$path" 2>&1)
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        printf 'FAIL  %s: the hook accepted a message that violates the rule\n' "$title"
+        failed=$((failed + 1))
+    elif ! printf '%s\n' "$output" | grep -qF "$expected"; then
+        printf 'FAIL  %s: rejected, but not for the expected reason\n%s\n' "$title" "$output"
+        failed=$((failed + 1))
+    else
+        printf 'ok    %s\n' "$title"
+        passed=$((passed + 1))
+    fi
+}
+
+assert_commit_msg_accepts() {
+    local title="$1" message="$2"
+    local path output status
+    path=$(mktemp "$scratch_root/message.XXXXXX")
+    printf '%s\n' "$message" >"$path"
+    output=$("$hooks_dir/commit-msg" "$path" 2>&1)
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        printf 'FAIL  %s: the hook rejected a valid message\n%s\n' "$title" "$output"
+        failed=$((failed + 1))
+    else
+        printf 'ok    %s\n' "$title"
+        passed=$((passed + 1))
+    fi
+}
+
+# Check 1: banner-style comment separators.
+fixture=$(new_fixture)
+{
+    printf '%s\n' '// ===== Records =====' 'pub const WIDTH: usize = 4;' ''
+    tests_module
+} >"$fixture/src/banner.rs"
+assert_precommit_rejects "banner separator is rejected" "$fixture" "banner-style comment separators"
+
+# Check 2: unbalanced and misnamed region markers.
+fixture=$(new_fixture)
+{
+    printf '%s\n' '// region: Records' 'pub const WIDTH: usize = 4;' ''
+    tests_module
+} >"$fixture/src/unclosed.rs"
+assert_precommit_rejects "unclosed region is rejected" "$fixture" "is never closed"
+
+fixture=$(new_fixture)
+{
+    printf '%s\n' '// region: Records' 'pub const WIDTH: usize = 4;' '// endregion: Parsing' ''
+    tests_module
+} >"$fixture/src/mismatched.rs"
+assert_precommit_rejects "misnamed endregion is rejected" "$fixture" "does not close region"
+
+fixture=$(new_fixture)
+{
+    printf '%s\n' '// endregion: Records' ''
+    tests_module
+} >"$fixture/src/orphan.rs"
+assert_precommit_rejects "orphan endregion is rejected" "$fixture" "never opened"
+
+# Check 3: module declarations outside the crate root. Any module may become a facade, so the
+# rule is not keyed to one filename.
+for module in records files scheduling; do
+    fixture=$(new_fixture)
+    {
+        printf '%s\n' 'pub mod codecs;' 'pub const WIDTH: usize = 4;' ''
+        tests_module
+    } >"$fixture/src/$module.rs"
+    assert_precommit_rejects "pub mod in src/$module.rs is rejected" "$fixture" "declares siblings"
+done
+
+# The crate root is the one file that may declare them, and an inline test module opens a brace
+# rather than ending in a semicolon, so neither trips the check.
+fixture=$(new_fixture)
+printf '%s\n' 'pub mod records;' 'pub mod files;' >"$fixture/src/lib.rs"
+{
+    printf '%s\n' 'pub const WIDTH: usize = 4;' ''
+    tests_module
+} >"$fixture/src/records.rs"
+assert_precommit_accepts "the crate root may declare modules" "$fixture"
+
+# Check 4: banned project vocabulary.
+fixture=$(new_fixture)
+printf '%s\n' '# Design' '' 'Each worker owns one shard of the input.' >"$fixture/NOTES.md"
+assert_precommit_rejects "the word shard is rejected" "$fixture" "banned vocabulary"
+
+fixture=$(new_fixture)
+{
+    printf '%s\n' 'pub fn split_into_SHARDS() {}' ''
+    tests_module
+} >"$fixture/src/casing.rs"
+assert_precommit_rejects "uppercase spelling is rejected too" "$fixture" "banned vocabulary"
+
+# The retired crate spelling.
+fixture=$(new_fixture)
+{
+    printf '%s\n' 'use faster_fasta::records::Record;' '' 'pub fn head(record: &Record) {}' ''
+    tests_module
+} >"$fixture/bin/importer.rs"
+assert_precommit_rejects "underscore crate spelling is rejected" "$fixture" "retired crate spelling"
+
+fixture=$(new_fixture)
+printf '%s\n' '# Install' '' 'Run `cargo install faster-fasta` to get the tools.' >"$fixture/INSTALL.md"
+assert_precommit_rejects "dashed package spelling is rejected" "$fixture" "retired crate spelling"
+
+fixture=$(new_fixture)
+# A complete manifest, because staging one turns on the rustfmt and clippy checks and a partial
+# one fails them for a reason that has nothing to do with the rule under test.
+{
+    printf '%s\n' '[package]' 'name = "fasterfasta"' 'version = "0.1.0"' 'edition = "2021"' \
+        'repository = "https://github.com/ashvardanian/faster-fasta"' '' '[dependencies]'
+} >"$fixture/Cargo.toml"
+printf '%s\n' 'pub fn width() -> usize {' '    4' '}' >"$fixture/src/lib.rs"
+assert_precommit_accepts "the repository URL keeps its path" "$fixture"
+
+# Formatting and static analysis. Both need a real crate, so these fixtures carry a manifest, and
+# each is written to trip exactly one of the two.
+fixture=$(new_fixture)
+{
+    printf '%s\n' '[package]' 'name = "fixture"' 'version = "0.1.0"' 'edition = "2021"' \
+        '' '[dependencies]'
+} >"$fixture/Cargo.toml"
+printf '%s\n' 'pub fn width(  a:usize )->usize{a}' >"$fixture/src/lib.rs"
+assert_precommit_rejects "an unformatted file is rejected" "$fixture" "rustfmt would change"
+
+fixture=$(new_fixture)
+{
+    printf '%s\n' '[package]' 'name = "fixture"' 'version = "0.1.0"' 'edition = "2021"' \
+        '' '[dependencies]'
+} >"$fixture/Cargo.toml"
+{
+    printf '%s\n' 'pub fn empty(values: &[usize]) -> bool {' '    values.len() == 0' '}'
+} >"$fixture/src/lib.rs"
+assert_precommit_rejects "a clippy lint is rejected" "$fixture" "clippy found problems"
+
+# A cargo that cannot run at all is not a lint. An unresolvable dependency, a missing component and
+# a poisoned lock all reach the same place as a real warning, and reporting them as "clippy found
+# problems" sends the author hunting for a diagnostic that was never emitted.
+fixture=$(new_fixture)
+{
+    printf '%s\n' '[package]' 'name = "fixture"' 'version = "0.1.0"' 'edition = "2021"' \
+        '' '[dependencies]' 'absent = { path = "../absent" }'
+} >"$fixture/Cargo.toml"
+printf '%s\n' 'pub fn width() -> usize {' '    4' '}' >"$fixture/src/lib.rs"
+assert_precommit_rejects "an unresolvable dependency is not reported as a lint" "$fixture" \
+    "cargo clippy could not run"
+
+# Neither gate may reject a clean tree just because the toolchain is absent. A clone on a machine
+# with no Rust installed still has to be able to commit a documentation fix.
+fixture=$(new_fixture)
+{
+    printf '%s\n' '[package]' 'name = "fixture"' 'version = "0.1.0"' 'edition = "2021"' \
+        '' '[dependencies]'
+} >"$fixture/Cargo.toml"
+printf '%s\n' 'pub fn width() -> usize {' '    4' '}' >"$fixture/src/lib.rs"
+(
+    cd "$fixture" && git add -A >/dev/null 2>&1
+    PATH=/usr/bin:/bin "$hooks_dir/pre-commit" >/dev/null 2>&1
+)
+if [ "$?" -eq 0 ]; then
+    printf 'ok    %s\n' "a clean tree commits without cargo on PATH"
+    passed=$((passed + 1))
+else
+    printf 'FAIL  %s\n' "a clean tree commits without cargo on PATH"
+    failed=$((failed + 1))
+fi
+
+# Check 5: exactly one tests module per Rust source file.
+fixture=$(new_fixture)
+printf '%s\n' 'pub const WIDTH: usize = 4;' >"$fixture/src/untested.rs"
+assert_precommit_rejects "missing tests module is rejected" "$fixture" "exactly one"
+
+# The crate root is the one file exempt from that rule: declarations and a doc comment hold no
+# behaviour, so there is nothing in them for a test to pin down.
+fixture=$(new_fixture)
+printf '%s\n' '//! Faster FASTA — utilities over sequence files.' '' 'pub mod codecs;' 'pub mod records;' \
+    >"$fixture/src/lib.rs"
+assert_precommit_accepts "src/lib.rs needs no tests module" "$fixture"
+
+fixture=$(new_fixture)
+{
+    printf '%s\n' 'pub const WIDTH: usize = 4;' ''
+    tests_module
+    printf '\n'
+    tests_module
+} >"$fixture/src/doubled.rs"
+assert_precommit_rejects "duplicate tests module is rejected" "$fixture" "exactly one"
+
+# Check 6: asterisk emphasis in Markdown.
+fixture=$(new_fixture)
+printf '%s\n' '# Design' '' 'The parser is **fast** on every input.' >"$fixture/BOLD.md"
+assert_precommit_rejects "asterisk bold is rejected" "$fixture" "asterisk emphasis"
+
+fixture=$(new_fixture)
+printf '%s\n' '# Design' '' 'The parser is *fast* on every input.' >"$fixture/ITALIC.md"
+assert_precommit_rejects "asterisk italic is rejected" "$fixture" "asterisk emphasis"
+
+# Check 7: two sentences on one Markdown line.
+fixture=$(new_fixture)
+printf '%s\n' '# Design' '' 'The parser is fast. It never allocates per record.' >"$fixture/PROSE.md"
+assert_precommit_rejects "two sentences on a line are rejected" "$fixture" "more than one sentence"
+
+# Check 8: backward-looking comments.
+fixture=$(new_fixture)
+{
+    printf '%s\n' '/// The counter previously lived in the parser.' 'pub const WIDTH: usize = 4;' ''
+    tests_module
+} >"$fixture/src/history.rs"
+assert_precommit_rejects "backward-looking comment is rejected" "$fixture" "backward-looking comment"
+
+fixture=$(new_fixture)
+{
+    printf '%s\n' '// This helper is no longer generic over the format.' 'pub const WIDTH: usize = 4;' ''
+    tests_module
+} >"$fixture/src/stale.rs"
+assert_precommit_rejects "'no longer' is rejected" "$fixture" "backward-looking comment"
+
+# The phrasings that name a past state without using one of the adverbs. A real comment reading
+# "The previous implementation allocated two vectors per record" survived the first word list,
+# which is why these are covered separately rather than trusted to the same pattern.
+for phrasing in \
+    'The previous implementation allocated two vectors per record.' \
+    'The old version walked the chain from the start.' \
+    'Before this change the budget came from the worker count.' \
+    'This field has been replaced by the block table.'
+do
+    fixture=$(new_fixture)
+    {
+        printf '%s\n' "/// $phrasing" 'pub const WIDTH: usize = 4;' ''
+        tests_module
+    } >"$fixture/src/history.rs"
+    assert_precommit_rejects "rejects: ${phrasing:0:38}" "$fixture" "backward-looking comment"
+done
+
+# A comment may still describe what the code does now in words that merely look retrospective.
+fixture=$(new_fixture)
+{
+    printf '%s\n' '/// Reuses the buffer, so a long run allocates only while warming up.' \
+        'pub const WIDTH: usize = 4;' ''
+    tests_module
+} >"$fixture/src/present.rs"
+assert_precommit_accepts "a present-tense comment passes" "$fixture"
+
+# Check 9: abbreviated identifiers.
+fixture=$(new_fixture)
+{
+    printf '%s\n' 'pub fn first(values: &[u8]) -> u8 {' '    let idx = 0;' '    values[idx]' '}' ''
+    tests_module
+} >"$fixture/src/abbreviated.rs"
+assert_precommit_rejects "abbreviated identifier is rejected" "$fixture" "abbreviated identifier"
+
+fixture=$(new_fixture)
+{
+    printf '%s\n' 'pub fn head(buf: &[u8]) -> u8 {' '    buf[0]' '}' ''
+    tests_module
+} >"$fixture/src/buffered.rs"
+assert_precommit_rejects "'buf' is rejected" "$fixture" "abbreviated identifier"
+
+# Check 10: std::sync::Mutex under src/.
+fixture=$(new_fixture)
+{
+    printf '%s\n' 'use std::sync::Mutex;' '' 'pub fn counter() -> Mutex<usize> {' '    Mutex::new(0)' '}' ''
+    tests_module
+} >"$fixture/src/locked.rs"
+assert_precommit_rejects "std::sync::Mutex under src/ is rejected" "$fixture" "parks a busy-waiting worker"
+
+# The clean tree. Everything here is house style, and every construct that a naive version of one of
+# the checks would misread is present on purpose: a Markdown table whose delimiter row is a run of
+# dashes, a fenced block full of asterisks, a list bullet, a glob, a sentence carrying 'e.g.', and a
+# bullet whose term ends in a period inside the emphasis markers.
+fixture=$(new_fixture)
+{
+    printf '%s\n' \
+        '// region: Records' \
+        '' \
+        '/// One record borrowed out of the input.' \
+        'pub struct Record<'"'"'a> {' \
+        '    pub header: &'"'"'a [u8],' \
+        '}' \
+        '' \
+        '// endregion: Records' \
+        ''
+    tests_module
+} >"$fixture/src/clean.rs"
+{
+    printf '%s\n' \
+        '# Faster FASTA' \
+        '' \
+        'The parser is __fast__ on every _input_ shape.' \
+        'Nothing is held between records, e.g. Phred tables stay on the stack.' \
+        '' \
+        '| Input | Access |' \
+        '| ----------------- | ----------------- |' \
+        '| `.fa` | byte-addressable |' \
+        '' \
+        '- __Streaming.__ Records are read one window at a time.' \
+        '- Globs such as `src/*.rs` name every input at once.' \
+        '' \
+        '```' \
+        'let product = 2 * 3 * 4;' \
+        '**not bold, just a code sample**' \
+        '```'
+} >"$fixture/README.md"
+assert_precommit_accepts "clean tree passes" "$fixture"
+
+# The std::fmt exemption. A Display implementation cannot rename the trait method, so the three
+# spellings the trait forces on it must not read as abbreviations.
+fixture=$(new_fixture)
+{
+    printf '%s\n' \
+        'use std::fmt;' \
+        '' \
+        'pub struct Record;' \
+        '' \
+        'impl fmt::Display for Record {' \
+        '    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {' \
+        '        write!(formatter, "record")' \
+        '    }' \
+        '}' \
+        ''
+    tests_module
+} >"$fixture/src/display.rs"
+assert_precommit_accepts "std::fmt spellings pass" "$fixture"
+
+# Nested regions and prose inside a fence. A region may sit inside another region as long as the
+# innermost one closes first, and text inside a fenced block is a transcript rather than prose, so
+# neither the sentence rule nor the emphasis rule reaches into it.
+fixture=$(new_fixture)
+{
+    printf '%s\n' \
+        '// region: Parsing' \
+        '' \
+        '// region: Headers' \
+        'pub const SIGIL: u8 = b'"'"'>'"'"';' \
+        '// endregion: Headers' \
+        '' \
+        '// endregion: Parsing' \
+        ''
+    tests_module
+} >"$fixture/src/nested.rs"
+{
+    printf '%s\n' \
+        '# Usage' \
+        '' \
+        'The tool reads one record at a time.' \
+        '' \
+        '```' \
+        '$ fasta-dedup input.fa' \
+        'Read 4 records. Wrote 3 records. Dropped 1 duplicate.' \
+        '```'
+} >"$fixture/USAGE.md"
+assert_precommit_accepts "nested regions and fenced prose pass" "$fixture"
+
+# Commit messages.
+assert_commit_msg_rejects "Claude co-author trailer is rejected" \
+    "Add: Streaming reader
+
+Co-Authored-By: Claude <noreply@anthropic.com>" "tool attributions"
+assert_commit_msg_rejects "generated-with footer is rejected" \
+    "Add: Streaming reader
+
+Generated with Claude Code" "tool attributions"
+assert_commit_msg_rejects "session link is rejected" \
+    "Add: Streaming reader
+
+Claude-Session: https://claude.ai/code/session_1" "tool attributions"
+assert_commit_msg_rejects "unsanctioned verb is rejected" \
+    "Refactor: Split the parser" "four sanctioned verbs"
+assert_commit_msg_rejects "missing verb is rejected" \
+    "Split the parser in two" "four sanctioned verbs"
+assert_commit_msg_rejects "lowercase word after the verb is rejected" \
+    "Add: streaming reader" "four sanctioned verbs"
+assert_commit_msg_accepts "sanctioned verb passes" \
+    "Improve: Streaming reader
+
+The window now resynchronizes on the next record boundary."
+assert_commit_msg_accepts "merge subject passes" "Merge branch 'main' into feature"
+assert_commit_msg_accepts "revert subject passes" 'Revert "Add: Streaming reader"'
+
+printf '\n%d passed, %d failed\n' "$passed" "$failed"
+[ "$failed" -eq 0 ]

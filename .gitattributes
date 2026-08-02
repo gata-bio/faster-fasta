@@ -1,0 +1,8 @@
+# Normalize every text file to LF in the repository, and check it out as LF on every platform.
+#
+# Git for Windows defaults `core.autocrlf` on. A CRLF checkout gives .githooks/ a shebang ending in
+# a carriage return, so the kernel looks for `bash\r`, every hook exits 127, and Git rejects the
+# commit. It also loses `cargo fmt --check`, since rustfmt writes LF. `eol=lf` is the operative
+# part - `text=auto` alone still yields CRLF worktrees there. Binary content is auto-detected and
+# left untouched.
+* text=auto eol=lf

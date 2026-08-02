@@ -1,0 +1,447 @@
+#!/usr/bin/env bash
+#
+# FasterFASTA pre-commit hook - house-style guards over the staged tree.
+# Install once per clone with:  git config core.hooksPath .githooks
+# Bypass in a genuine emergency with:  git commit --no-verify
+#
+# Every check below runs and reports independently, and the hook exits once at the end. A commit
+# that trips three rules shows all three, so the author fixes them in one pass instead of being
+# rejected three times in a row. Each check carries its own rationale, so this file is the rulebook.
+#
+# Portability: bash 3.2 and a POSIX awk are enough - no mapfile, no associative arrays, no GNU-only
+# grep or sed flags - so a stock macOS shell and Git for Windows both run this unchanged.
+
+set -u
+LC_ALL=C # Byte-wise regexes, immune to the committer's locale
+
+failures=0
+
+# Prints the headline, the offending lines, and the remedy, then marks the commit rejected. Every
+# accumulator ends in a newline, so the matches are written with `printf '%s'`.
+fail() { # fail <matches> <headline> <remedy-line>...
+    local matches=$1 headline=$2
+    shift 2
+    echo "pre-commit: $headline" >&2
+    printf '%s' "$matches" >&2
+    local remedy
+    for remedy in "$@"; do echo "$remedy" >&2; done
+    failures=$((failures + 1))
+}
+
+# region Staged Set
+
+# The staged set is: added or modified, still present on disk, text only. Deletions are dropped by
+# --diff-filter, a generated lock file carries no house style, and a binary would only yield
+# garbage matches. `grep -Iq .` is the binary test - the -I flag suppresses matches in binary
+# files, so a binary and an empty file both fall out here.
+#
+# The hooks directory is exempt from every content scan. A hook has to spell out the very patterns
+# it bans, so scanning it would flag the rule text rather than a violation of the rule.
+staged_files=()
+while IFS= read -r -d '' file; do
+    [ -f "$file" ] || continue
+    case "$file" in
+        .githooks/*) continue ;;
+        *.png | *.jpg | *.jpeg | *.gif | *.ico | *.pdf | *.gz | *.bgz | *.zst | Cargo.lock) continue ;;
+    esac
+    grep -Iq . -- "$file" 2>/dev/null || continue
+    staged_files+=("$file")
+done < <(git diff --cached --name-only --diff-filter=ACM -z)
+
+# Nothing to inspect. Exiting here also means every loop below can expand the array unguarded,
+# which is what keeps this readable under bash 3.2, where `"${empty[@]}"` trips `set -u`.
+if [ "${#staged_files[@]}" -eq 0 ]; then
+    exit 0
+fi
+
+# endregion Staged Set
+
+# region Structure
+
+# Comment-style banner separators - a comment lead-in (//, #, /*, *, ;, --) followed by four or
+# more '=' or '-' used purely as a visual divider. Section boundaries must be annotated with
+# rust-analyzer fold markers instead, so an editor can collapse a section and a reader can see the
+# section's name rather than a wall of punctuation:
+#
+#     // region: Some Section
+#     ...
+#     // endregion: Some Section
+#
+# Bare Markdown rules and setext underlines are not comments, so they never reach the pattern.
+# Markdown table delimiter rows are - a leading space in front of `-------` reads as the `--`
+# lead-in - so they are filtered back out explicitly.
+banner_pattern='(^|[[:space:]])(//|#|/\*|\*|;|--)[[:space:]]*(={4,}|-{4,})'
+table_row_pattern='^[0-9]+:[[:space:]]*(//[/!]?|#|\*)?[[:space:]]*\|[-:|[:space:]]*\|[-:|[:space:]]*$'
+banners=""
+for file in "${staged_files[@]}"; do
+    hits=$(grep -nE "$banner_pattern" -- "$file" 2>/dev/null | grep -vE "$table_row_pattern" || true)
+    [ -n "$hits" ] && banners+=$(printf '%s\n' "$hits" | sed "s|^|  $file:|")$'\n'
+done
+if [ -n "$banners" ]; then
+    fail "$banners" \
+        "banner-style comment separators are banned; name the section instead." \
+        "Replace the divider with '// region: Name' above and '// endregion: Name' below."
+fi
+
+# Region markers must balance within a file, name by name. An unclosed region silently swallows
+# every following section into itself when the editor folds, and a mismatched name means two
+# sections were merged by accident during an edit. The check is a stack, so nesting is allowed as
+# long as the innermost open region is the one being closed.
+regions=""
+for file in "${staged_files[@]}"; do
+    hits=$(awk -v file="$file" '
+        /^[[:space:]]*\/\/[[:space:]]*region:/ {
+            name = $0
+            sub(/^[[:space:]]*\/\/[[:space:]]*region:[[:space:]]*/, "", name)
+            sub(/[[:space:]]+$/, "", name)
+            depth++
+            names[depth] = name
+            lines[depth] = NR
+            next
+        }
+        /^[[:space:]]*\/\/[[:space:]]*endregion:/ {
+            name = $0
+            sub(/^[[:space:]]*\/\/[[:space:]]*endregion:[[:space:]]*/, "", name)
+            sub(/[[:space:]]+$/, "", name)
+            if (depth == 0) {
+                printf "  %s:%d: endregion: %s closes a region that was never opened\n", file, NR, name
+            } else if (names[depth] != name) {
+                printf "  %s:%d: endregion: %s does not close region: %s opened on line %d\n", file, NR, name, names[depth], lines[depth]
+                depth--
+            } else {
+                depth--
+            }
+            next
+        }
+        END {
+            while (depth > 0) {
+                printf "  %s:%d: region: %s is never closed\n", file, lines[depth], names[depth]
+                depth--
+            }
+        }
+    ' "$file" 2>/dev/null)
+    [ -n "$hits" ] && regions+="$hits"$'\n'
+done
+if [ -n "$regions" ]; then
+    fail "$regions" \
+        "region markers do not balance." \
+        "Every '// region: Name' needs a '// endregion: Name' with the identical name."
+fi
+
+# Module declarations outside src/lib.rs. Every module here is a layer some other layer borrows
+# from, and none of them may double as a facade that re-exports its siblings. A layer that declares
+# its own consumers cannot be read, moved, or compiled apart from them, and once one file becomes
+# the place everything is imported from, the module boundaries stop meaning anything. The crate
+# root declares the modules; nothing else does. A `mod tests {` block opens a brace rather than
+# ending in a semicolon, so an inline test module never matches.
+facade=""
+for file in "${staged_files[@]}"; do
+    case "$file" in
+        src/lib.rs) continue ;;
+        src/*.rs) ;;
+        *) continue ;;
+    esac
+    hits=$(grep -nE '^[[:space:]]*(pub )?mod [a-z_]+;' -- "$file" 2>/dev/null | sed "s|^|  $file:|" || true)
+    [ -n "$hits" ] && facade+="$hits"$'\n'
+done
+if [ -n "$facade" ]; then
+    fail "$facade" \
+        "a module declares siblings; only src/lib.rs may do that." \
+        "Move the 'mod' declarations to src/lib.rs and leave this file with its own layer only."
+fi
+
+# endregion Structure
+
+# region Vocabulary
+
+# Banned project vocabulary: the word 'shard' in any casing. In a glob of archives, each archive is
+# already an independent piece of work, so the word collides with the name of an input file and
+# every sentence using it becomes ambiguous. The project has four precise words instead:
+#
+#     input       one file out of a glob
+#     block       one unit inside a block-addressable input
+#     byte range  one extent of a byte-addressable input
+#     slab        one window generation of a stream
+#
+# Pick the one that names the thing actually being described.
+vocabulary=""
+for file in "${staged_files[@]}"; do
+    hits=$(grep -niE 'shard' -- "$file" 2>/dev/null | sed "s|^|  $file:|" || true)
+    [ -n "$hits" ] && vocabulary+="$hits"$'\n'
+done
+if [ -n "$vocabulary" ]; then
+    fail "$vocabulary" \
+        "banned vocabulary 'shard' - it collides with how one archive of a glob is named." \
+        "Use 'input' for one file of a glob, 'block' for a unit of a block-addressable input," \
+        "'byte range' for an extent of a byte-addressable one, 'slab' for one window of a stream."
+fi
+
+# The retired crate spelling. The package is 'fasterfasta' and the crate imported as
+# 'use fasterfasta::', with no separator in either. The old 'faster_fasta' and 'faster-fasta' forms
+# still compile nowhere, but they survive in muscle memory and in every snippet pasted out of an
+# older file, so they come back one import line at a time unless a check turns them away. A URL
+# pointing at github.com is exempt: the repository path is a real address on someone else's server,
+# and renaming a crate does not rename it.
+retired_name=""
+for file in "${staged_files[@]}"; do
+    case "$file" in
+        *.rs | *.md | *.toml) ;;
+        *) continue ;;
+    esac
+    hits=$(grep -niE 'faster[_-]fasta' -- "$file" 2>/dev/null | grep -vF 'github.com/' | sed "s|^|  $file:|" || true)
+    [ -n "$hits" ] && retired_name+="$hits"$'\n'
+done
+if [ -n "$retired_name" ]; then
+    fail "$retired_name" \
+        "retired crate spelling; the package and the crate are both 'fasterfasta'." \
+        "Write 'use fasterfasta::' and the package name without a separator."
+fi
+
+# endregion Vocabulary
+
+# region Rust Sources
+
+# Exactly one '#[cfg(test)] mod tests' per Rust source file - not zero, not two. Zero means a file
+# shipped with no coverage of its own and the next reader has to guess which distant test exercises
+# it. Two means the tests split along a seam that the module itself does not have, and a reader
+# looking for the coverage of a function finds only half of it.
+#
+# src/lib.rs is the one exemption. The crate root holds a doc comment and its module declarations
+# and nothing else, so there is no behaviour in it for a test to pin down.
+test_modules=""
+for file in "${staged_files[@]}"; do
+    case "$file" in
+        src/lib.rs) continue ;;
+        *.rs) ;;
+        *) continue ;;
+    esac
+    count=$(awk '
+        /^[[:space:]]*#\[cfg\(test\)\]/ { pending = 3; next }
+        pending > 0 {
+            if ($0 ~ /^[[:space:]]*mod[[:space:]]+tests[[:space:]]*\{/) { count++; pending = 0; next }
+            pending--
+        }
+        END { print count + 0 }
+    ' "$file")
+    [ "$count" -eq 1 ] || test_modules+="  $file: $count '#[cfg(test)] mod tests' blocks, expected exactly 1"$'\n'
+done
+if [ -n "$test_modules" ]; then
+    fail "$test_modules" \
+        "every Rust source file carries exactly one '#[cfg(test)] mod tests'." \
+        "Add the missing module, or merge the duplicates into one."
+fi
+
+# Backward-looking words in Rust comments. A comment states what the code is and does now; the
+# reader of a file has no way to check a claim about a state of the world that no longer exists,
+# and the claim rots the moment the next edit lands. Git already holds the history, in a form that
+# stays accurate. Only the comment portion of a line is scanned, so a string literal is untouched.
+retrospection=""
+for file in "${staged_files[@]}"; do
+    case "$file" in
+        *.rs) ;;
+        *) continue ;;
+    esac
+    hits=$(awk -v file="$file" '
+        {
+            slashes = index($0, "//")
+            block = index($0, "/*")
+            start = slashes
+            if (block > 0 && (start == 0 || block < start)) start = block
+            if (start == 0) next
+            comment = tolower(substr($0, start))
+            if (comment ~ /(previously|used to|moved from|no longer|was renamed|formerly|previous (implementation|version|design|approach)|the old (implementation|version|code|way)|before this (change|commit)|instead of the old|has been (renamed|replaced|moved))/) {
+                printf "  %s:%d: %s\n", file, NR, $0
+            }
+        }
+    ' "$file" 2>/dev/null)
+    [ -n "$hits" ] && retrospection+="$hits"$'\n'
+done
+if [ -n "$retrospection" ]; then
+    fail "$retrospection" \
+        "backward-looking comment; describe what the code does now." \
+        "Drop the history from the comment and state the present purpose; git holds the rest."
+fi
+
+# Abbreviated identifiers in Rust sources. The denylist is deliberately eight words long and no
+# longer: a general heuristic over short names would fire on 'len', 'min' and 'max', where the
+# contraction is the accepted spelling, and a check that cries wolf gets switched off within a
+# week. These eight always have a real word behind them - index, formatter, count, temporary,
+# buffer, pointer, character, position. The 'fmt' spellings that std::fmt forces on an
+# implementation are exempt, since the trait method name is not ours to choose.
+abbreviations=""
+for file in "${staged_files[@]}"; do
+    case "$file" in
+        *.rs) ;;
+        *) continue ;;
+    esac
+    hits=$(awk -v file="$file" '
+        {
+            text = $0
+            gsub(/use std::fmt/, "", text)
+            gsub(/fmt::[A-Za-z_]+/, "", text)
+            gsub(/fn fmt\(/, "", text)
+            if (text ~ /(^|[^A-Za-z0-9_])(idx|fmt|cnt|tmp|buf|ptr|ch|pos)([^A-Za-z0-9_]|$)/) {
+                printf "  %s:%d: %s\n", file, NR, $0
+            }
+        }
+    ' "$file" 2>/dev/null)
+    [ -n "$hits" ] && abbreviations+="$hits"$'\n'
+done
+if [ -n "$abbreviations" ]; then
+    fail "$abbreviations" \
+        "abbreviated identifier; spell the word out." \
+        "idx -> index, fmt -> formatter, cnt -> count, tmp -> temporary," \
+        "buf -> buffer, ptr -> pointer, ch -> character, pos -> position."
+fi
+
+# std::sync::Mutex under src/. ForkUnion worker threads busy-wait and never block, so a std mutex
+# parks a thread inside a pool built entirely around spinning: the parked worker stops draining its
+# queue, the spinning workers keep burning their cores waiting for it, and the pool loses a core
+# for the duration of a scheduler round trip. The sanctioned primitive is forkunion::SpinMutex,
+# which contends the same way the pool already does. SpinMutex itself is not matched, because the
+# pattern requires the token to start on a word boundary.
+mutexes=""
+for file in "${staged_files[@]}"; do
+    case "$file" in
+        src/*) ;;
+        *) continue ;;
+    esac
+    hits=$(grep -nE '(^|[^A-Za-z0-9_])Mutex([^A-Za-z0-9_]|$)' -- "$file" 2>/dev/null | sed "s|^|  $file:|" || true)
+    [ -n "$hits" ] && mutexes+="$hits"$'\n'
+done
+if [ -n "$mutexes" ]; then
+    fail "$mutexes" \
+        "std::sync::Mutex under src/; a blocking lock parks a busy-waiting worker." \
+        "Use forkunion::SpinMutex, which contends the way the ForkUnion pool already does."
+fi
+
+# endregion Rust Sources
+
+# region Markdown Prose
+
+# Asterisk emphasis in Markdown. The house forms are __bold__ and _italic_, which survive being
+# read as plain text and never collide with a glob or a multiplication sign. Fenced code blocks are
+# skipped wholesale, inline code spans are replaced before matching so `src/*.rs` is invisible, and
+# a leading list bullet is stripped so '* item' is not read as an unterminated emphasis run. What
+# remains has to open on a word boundary and close on a non-space character to count.
+emphasis=""
+for file in "${staged_files[@]}"; do
+    case "$file" in
+        *.md) ;;
+        *) continue ;;
+    esac
+    hits=$(awk -v file="$file" '
+        /^[[:space:]]*(```|~~~)/ { fenced = !fenced; next }
+        fenced { next }
+        {
+            text = $0
+            gsub(/`[^`]*`/, "Code", text)
+            sub(/^[[:space:]]*[*+-][[:space:]]+/, "", text)
+            if (text ~ /\*\*[^*[:space:]]([^*]*[^*[:space:]])?\*\*/ ||
+                text ~ /(^|[[:space:]([])\*[^*[:space:]]([^*]*[^*[:space:]])?\*([^*[:alnum:]]|$)/) {
+                printf "  %s:%d: %s\n", file, NR, $0
+            }
+        }
+    ' "$file" 2>/dev/null)
+    [ -n "$hits" ] && emphasis+="$hits"$'\n'
+done
+if [ -n "$emphasis" ]; then
+    fail "$emphasis" \
+        "asterisk emphasis in Markdown; the house forms are __bold__ and _italic_." \
+        "Rewrite **bold** as __bold__ and *italic* as _italic_."
+fi
+
+# Two or more sentences on one Markdown line. One sentence per line keeps every diff per-sentence,
+# so a reviewer sees which claim changed instead of a reflowed paragraph. The trigger is a
+# sentence-ending '.', '!' or '?' followed by whitespace and a capital letter. Fenced code blocks,
+# table rows, and lines carrying an abbreviation such as 'e.g.' are skipped, and inline code spans
+# are replaced first so a period inside a filename cannot end a sentence. The bullet lead-in
+# '- __Term.__ Definition' deliberately does not match, because the period sits inside the emphasis
+# markers rather than in front of the space.
+sentences=""
+for file in "${staged_files[@]}"; do
+    case "$file" in
+        *.md) ;;
+        *) continue ;;
+    esac
+    hits=$(awk -v file="$file" '
+        /^[[:space:]]*(```|~~~)/ { fenced = !fenced; next }
+        fenced { next }
+        /^[[:space:]]*\|/ { next }
+        /(e\.g\.|i\.e\.|etc\.|vs\.|cf\.|Ph\.D\.|U\.S\.|et al\.)/ { next }
+        {
+            text = $0
+            gsub(/`[^`]*`/, "Code", text)
+            if (text ~ /[.!?]["'"'"')]?[[:space:]]+[A-Z]/) {
+                printf "  %s:%d: %s\n", file, NR, $0
+            }
+        }
+    ' "$file" 2>/dev/null)
+    [ -n "$hits" ] && sentences+="$hits"$'\n'
+done
+if [ -n "$sentences" ]; then
+    fail "$sentences" \
+        "more than one sentence on a Markdown line." \
+        "Break the line after each sentence so diffs stay per-sentence."
+fi
+
+# endregion Markdown Prose
+
+# region Toolchain Gates
+
+# Formatting and static analysis, run only when Rust or the manifest is staged so a documentation
+# commit stays instant. Both inspect the working tree rather than the index, because rustfmt and
+# clippy read files from disk and there is no way to point them at staged content; a partially
+# staged tree can therefore report a file this commit does not touch. That is the right failure
+# direction - it says the tree is not clean, which is true.
+#
+# Warm, the pair costs about a second. Cold it pays for a full build, which is the price of never
+# landing an unformatted line rather than discovering it in review.
+#
+# Both gates are skipped without a manifest, since this hook is also exercised against bare fixture
+# repositories that hold Rust files but no crate, and without cargo on PATH, so a clone on a machine
+# with no Rust toolchain still commits rather than being rejected by a tool that never ran.
+if [ -f Cargo.toml ] && command -v cargo >/dev/null 2>&1 &&
+    printf '%s\n' "${staged_files[@]}" | grep -qE '\.rs$|^Cargo\.toml$'; then
+
+    if ! rustfmt_output=$(cargo fmt --check 2>&1); then
+        rustfmt_diffs=$(printf '%s\n' "$rustfmt_output" | grep -E '^Diff in' | sed 's|^Diff in |  |' | sort -u)
+        if [ -n "$rustfmt_diffs" ]; then
+            fail "$rustfmt_diffs"$'\n' "rustfmt would change these files." "Run 'cargo fmt'."
+        else
+            # No diff means rustfmt never got as far as reading a file - a missing component, an
+            # unparsable manifest. Reporting that as a formatting violation sends the author
+            # looking for whitespace that is not there.
+            fail "$(printf '%s\n' "$rustfmt_output" | head -5)"$'\n' \
+                "cargo fmt could not run." \
+                "This is a toolchain or manifest fault, not a formatting one; fix it and retry."
+        fi
+    fi
+
+    # `--all-targets` so test modules are linted too; they are where most of this crate lives.
+    # `--no-deps` keeps the sibling crates that .cargo/config.toml redirects to local working
+    # copies out of the report - their warnings are real, but they are not this commit's to fix.
+    if ! clippy_output=$(cargo clippy --all-targets --no-deps --quiet -- -D warnings 2>&1); then
+        # A lint carries a `-->` source location; a cargo that could not run at all - an
+        # unresolvable dependency, no network, a poisoned lock - carries none. The two need
+        # different remedies, so they get different messages.
+        if printf '%s\n' "$clippy_output" | grep -q -- '-->'; then
+            fail "$(printf '%s\n' "$clippy_output" | grep -E '^(error|warning)' | head -20)"$'\n' \
+                "clippy found problems." \
+                "Fix the lints above, or justify one with a scoped #[allow]."
+        else
+            fail "$(printf '%s\n' "$clippy_output" | head -5)"$'\n' \
+                "cargo clippy could not run." \
+                "This is a toolchain or dependency fault, not a lint; fix it and retry."
+        fi
+    fi
+fi
+
+# endregion Toolchain Gates
+
+if [ "$failures" -ne 0 ]; then
+    echo "pre-commit: $failures check(s) failed. Fix them, or bypass with --no-verify if intentional." >&2
+    exit 1
+fi
+
+exit 0

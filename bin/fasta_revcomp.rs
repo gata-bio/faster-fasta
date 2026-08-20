@@ -10,19 +10,23 @@
 //! # Examples
 //!
 //! ```bash
-//! fasta-revcomp sequences.fasta -o revcomp.fasta
-//! fasta-revcomp reads.fastq -o revcomp.fastq
-//! cat sequences.fasta | fasta-revcomp | fasta-sort -l
+//! fasta-revcomp sequences.fasta --output revcomp.fasta
+//! fasta-revcomp reads.fastq --output revcomp.fastq
+//! cat sequences.fasta | fasta-revcomp | fasta-sample --fraction 0.1
 //! ```
+//!
+//! Exit: 0 complemented a record, 1 ran and complemented none, 2 could not run.
 
 use std::io::{self, Write};
 
 use clap::Parser;
 use stringzilla::sz::lookup;
 
-use fasterfasta::files::{finish_or_exit, open_output, RecordWriter, Rendering};
+use fasterfasta::files::{
+    finish_or_exit, Destination, Presentation, RecordWriter, Rendering, RunOutcome,
+};
 use fasterfasta::records::{Complements, Record, SequenceFormat};
-use fasterfasta::scheduling::{for_each_record_in_inputs, Parallelism};
+use fasterfasta::scheduling::{for_each_record_to_destination, Parallelism};
 
 struct ReverseComplementer<W: Write> {
     writer: RecordWriter<W>,
@@ -91,40 +95,76 @@ struct Args {
     inputs: Vec<String>,
 
     /// Output file; '-' or omitted writes standard output
-    #[arg(short, long)]
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["output_dir", "in_place", "dry_run", "quiet"],
+        help_heading = "Output"
+    )]
     output: Option<String>,
 
-    /// Report how many records were converted, on standard error
-    #[arg(long)]
-    report: bool,
+    /// Write one output per input into this directory, keeping each input's file name
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["in_place", "dry_run", "quiet"],
+        help_heading = "Output"
+    )]
+    output_dir: Option<String>,
+
+    /// Rewrite each input, swapping the result in once it is whole on disk
+    #[arg(long, conflicts_with_all = ["dry_run", "quiet"], help_heading = "Output")]
+    in_place: bool,
+
+    /// Report what would be written, on standard error, without writing it
+    #[arg(long, conflicts_with = "quiet", help_heading = "Output")]
+    dry_run: bool,
+
+    /// Suppress all output; the exit code carries the answer
+    #[arg(long, help_heading = "Output")]
+    quiet: bool,
+
+    #[command(flatten)]
+    presentation: Presentation,
 
     #[command(flatten)]
     parallelism: Parallelism,
 }
 
-fn run(args: &Args) -> io::Result<()> {
-    let rendering = Rendering::for_output(args.output.as_deref());
-    let mut output = open_output(args.output.as_deref())?;
+fn run(args: &Args) -> io::Result<RunOutcome> {
+    let destination = if args.quiet || args.dry_run {
+        Destination::Discard
+    } else if args.in_place {
+        Destination::InPlace
+    } else if let Some(directory) = &args.output_dir {
+        Destination::Directory(directory.clone())
+    } else {
+        Destination::Stream(args.output.clone())
+    };
+    let rendering = args.presentation.rendering(destination.terminal_path());
     let mut workers = args.parallelism.ordered()?;
     // Each state buffers the records of one unit of work, and `retire` writes that buffer
     // out in turn, so the output is the same bytes however many workers ran.
     let mut states =
         workers.states(|| ReverseComplementer::new(Vec::new(), SequenceFormat::Fasta, rendering));
 
-    for_each_record_in_inputs(
+    for_each_record_to_destination(
         &args.inputs,
+        &destination,
+        rendering,
         &mut workers,
         &mut states,
         ReverseComplementer::push,
-        |state| state.writer.drain_into(&mut output),
+        |state, writer| state.writer.drain_into(writer.inner_mut()),
     )?;
-    output.flush()?;
 
-    if args.report {
-        let converted: u64 = states.iter().map(|state| state.converted).sum();
+    let converted: u64 = states.iter().map(|state| state.converted).sum();
+    if args.dry_run {
+        eprintln!("would complement {converted} records; nothing was written");
+    } else if args.presentation.summary {
         eprintln!("converted {converted} records");
     }
-    Ok(())
+    Ok(RunOutcome::of(converted as usize))
 }
 
 fn main() {
@@ -134,6 +174,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use fasterfasta::scheduling::for_each_record_in_bytes;
 
     fn revcomp(data: &[u8], format: SequenceFormat) -> String {
@@ -229,5 +270,46 @@ mod tests {
             ReverseComplementer::new(Vec::new(), SequenceFormat::Fasta, Rendering::PLAIN);
         for_each_record_in_bytes(data, &mut complementer, ReverseComplementer::push).unwrap();
         assert_eq!(complementer.converted, 3);
+    }
+
+    /// Every flag is spelled out, so a call site says what it does and nothing is remembered
+    /// by letter. `-h` and `-V` are clap's own and stay.
+    #[test]
+    fn declares_no_short_flags() {
+        // Built first, because `-h` and `-V` are only added then and they are the exemption.
+        let mut command = Args::command();
+        command.build();
+        assert!(command
+            .get_arguments()
+            .all(|argument| argument.get_short().is_none()
+                || matches!(argument.get_short(), Some('h') | Some('V'))));
+    }
+
+    /// Pins the surface, so adding, renaming, or reordering a flag is a deliberate edit here
+    /// rather than a drift nobody reviews.
+    #[test]
+    fn declares_the_expected_flags() {
+        let mut command = Args::command();
+        command.build();
+        let longs: Vec<_> = command
+            .get_arguments()
+            .filter_map(|argument| argument.get_long())
+            .collect();
+        assert_eq!(
+            longs,
+            [
+                "output",
+                "output-dir",
+                "in-place",
+                "dry-run",
+                "quiet",
+                "line-width",
+                "color",
+                "summary",
+                "threads",
+                "help",
+                "version"
+            ]
+        );
     }
 }

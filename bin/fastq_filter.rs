@@ -8,18 +8,22 @@
 //! # Examples
 //!
 //! ```bash
-//! fastq-filter reads.fastq -q 25 -l 75 -o filtered.fastq
-//! fastq-filter reads.fastq -n 0.05 -o low_ambiguity.fastq
-//! cat reads.fastq | fastq-filter -q 30 > filtered.fastq
+//! fastq-filter reads.fastq --min-quality 25 --min-length 75 --output filtered.fastq
+//! fastq-filter reads.fastq --max-n-fraction 0.05 --output low_ambiguity.fastq
+//! cat reads.fastq | fastq-filter --min-quality 30 > filtered.fastq
 //! ```
+//!
+//! Exit: 0 kept a record, 1 ran and kept none, 2 could not run.
 
 use std::io::{self, Write};
 
 use clap::Parser;
 
-use fasterfasta::files::{finish_or_exit, open_output, RecordWriter, Rendering};
+use fasterfasta::files::{
+    finish_or_exit, Destination, Presentation, RecordWriter, Rendering, RunOutcome,
+};
 use fasterfasta::records::{mean_quality, needs_fastq, Record, SequenceFormat};
-use fasterfasta::scheduling::{for_each_record_in_inputs, Parallelism};
+use fasterfasta::scheduling::{for_each_record_to_destination, Parallelism};
 
 /// Every criterion is optional; a `None` never rejects anything.
 #[derive(Debug, Clone, Copy, Default)]
@@ -134,35 +138,60 @@ struct Args {
     #[arg(default_value = "-")]
     inputs: Vec<String>,
 
-    /// Output file; '-' or omitted writes standard output
-    #[arg(short, long)]
-    output: Option<String>,
-
     /// Minimum mean Phred quality
-    #[arg(short = 'q', long)]
+    #[arg(long, value_name = "PHRED", help_heading = "Criteria")]
     min_quality: Option<f32>,
 
     /// Minimum sequence length
-    #[arg(short = 'l', long)]
+    #[arg(long, value_name = "N", help_heading = "Criteria")]
     min_length: Option<usize>,
 
     /// Maximum sequence length
-    #[arg(short = 'L', long)]
+    #[arg(long, value_name = "N", help_heading = "Criteria")]
     max_length: Option<usize>,
 
     /// Maximum fraction of N bases, between 0.0 and 1.0
-    #[arg(short = 'n', long)]
+    #[arg(long, value_name = "FRACTION", help_heading = "Criteria")]
     max_n_fraction: Option<f32>,
 
-    /// Report how many records were examined, retained, and dropped, on standard error
-    #[arg(long)]
-    report: bool,
+    /// Output file; '-' or omitted writes standard output
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["output_dir", "in_place", "dry_run", "quiet"],
+        help_heading = "Output"
+    )]
+    output: Option<String>,
+
+    /// Write one output per input into this directory, keeping each input's file name
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["in_place", "dry_run", "quiet"],
+        help_heading = "Output"
+    )]
+    output_dir: Option<String>,
+
+    /// Rewrite each input, swapping the result in once it is whole on disk
+    #[arg(long, conflicts_with_all = ["dry_run", "quiet"], help_heading = "Output")]
+    in_place: bool,
+
+    /// Report what would be written, on standard error, without writing it
+    #[arg(long, conflicts_with = "quiet", help_heading = "Output")]
+    dry_run: bool,
+
+    /// Suppress all output; the exit code carries the answer
+    #[arg(long, help_heading = "Output")]
+    quiet: bool,
+
+    #[command(flatten)]
+    presentation: Presentation,
 
     #[command(flatten)]
     parallelism: Parallelism,
 }
 
-fn run(args: &Args) -> io::Result<()> {
+fn run(args: &Args) -> io::Result<RunOutcome> {
     let criteria = Criteria {
         minimum_quality: args.min_quality,
         minimum_length: args.min_length,
@@ -172,31 +201,45 @@ fn run(args: &Args) -> io::Result<()> {
     // Config is checked before any input is opened, so a contradiction fails at once.
     criteria.validate()?;
 
-    let rendering = Rendering::for_output(args.output.as_deref());
-    let mut output = open_output(args.output.as_deref())?;
+    let destination = if args.quiet || args.dry_run {
+        Destination::Discard
+    } else if args.in_place {
+        Destination::InPlace
+    } else if let Some(directory) = &args.output_dir {
+        Destination::Directory(directory.clone())
+    } else {
+        Destination::Stream(args.output.clone())
+    };
+    let rendering = args.presentation.rendering(destination.terminal_path());
     let mut workers = args.parallelism.ordered()?;
     // Each state buffers the records of one unit of work, and `retire` writes that buffer
     // out in turn, so the output is the same bytes however many workers ran.
     let mut states = workers.states(|| Filter::new(Vec::new(), criteria, rendering));
 
-    for_each_record_in_inputs(
+    for_each_record_to_destination(
         &args.inputs,
+        &destination,
+        rendering,
         &mut workers,
         &mut states,
         Filter::push,
-        |state| state.writer.drain_into(&mut output),
+        |state, writer| state.writer.drain_into(writer.inner_mut()),
     )?;
-    output.flush()?;
 
-    if args.report {
-        let examined: usize = states.iter().map(|state| state.examined).sum();
-        let retained: usize = states.iter().map(|state| state.retained).sum();
+    let examined: usize = states.iter().map(|state| state.examined).sum();
+    let retained: usize = states.iter().map(|state| state.retained).sum();
+    if args.dry_run {
+        eprintln!(
+            "would retain {retained} of {examined} records, dropping {}; nothing was written",
+            examined - retained
+        );
+    } else if args.presentation.summary {
         eprintln!(
             "examined {examined} records, retained {retained}, dropped {}",
             examined - retained
         );
     }
-    Ok(())
+    Ok(RunOutcome::of(retained))
 }
 
 fn main() {
@@ -206,6 +249,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use fasterfasta::scheduling::for_each_record_in_bytes;
 
     /// A FASTA record has no quality, so a mean-quality threshold would silently reject
@@ -336,5 +380,50 @@ mod tests {
         for_each_record_in_bytes(MIXED, &mut filter, Filter::push).unwrap();
         assert_eq!(filter.examined, 2);
         assert_eq!(filter.retained, 1);
+    }
+
+    /// Every flag is spelled out, so a call site says what it does and nothing is remembered
+    /// by letter. `-h` and `-V` are clap's own and stay.
+    #[test]
+    fn declares_no_short_flags() {
+        // Built first, because `-h` and `-V` are only added then and they are the exemption.
+        let mut command = Args::command();
+        command.build();
+        assert!(command
+            .get_arguments()
+            .all(|argument| argument.get_short().is_none()
+                || matches!(argument.get_short(), Some('h') | Some('V'))));
+    }
+
+    /// Pins the surface, so adding, renaming, or reordering a flag is a deliberate edit here
+    /// rather than a drift nobody reviews.
+    #[test]
+    fn declares_the_expected_flags() {
+        let mut command = Args::command();
+        command.build();
+        let longs: Vec<_> = command
+            .get_arguments()
+            .filter_map(|argument| argument.get_long())
+            .collect();
+        assert_eq!(
+            longs,
+            [
+                "min-quality",
+                "min-length",
+                "max-length",
+                "max-n-fraction",
+                "output",
+                "output-dir",
+                "in-place",
+                "dry-run",
+                "quiet",
+                "line-width",
+                "color",
+                "summary",
+                "threads",
+                "help",
+                "version"
+            ]
+        );
     }
 }

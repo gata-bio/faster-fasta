@@ -13,8 +13,9 @@
 //! Scheduling lives in [`crate::scheduling`].
 //! Nothing here spawns a thread or picks a range, and nothing here declares a sibling module.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::ops::Deref;
+use std::path::{Path, PathBuf};
 
 use crate::records::{
     first_record_boundary, parse_leading_record, sequence_format, ParseOutcome, Record,
@@ -505,6 +506,199 @@ impl Rendering {
     }
 }
 
+/// When to colour nucleotides, for a caller that will not accept the detected answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ColorWhen {
+    /// Colour a terminal and nothing else, so redirecting and piping match.
+    Auto,
+    /// Colour whatever the destination is.
+    Always,
+    /// Colour nothing.
+    Never,
+}
+
+/// How a tool renders what it emits, and what it says about the run afterwards.
+///
+/// Flattened into every record-emitting tool, so `--line-width` means one thing across the
+/// suite and is documented once.
+#[derive(clap::Args, Debug, Clone, Copy)]
+pub struct Presentation {
+    /// Columns per sequence line, 0 for one line per sequence [default: 60 on a terminal, else 0]
+    #[arg(long, value_name = "N", help_heading = "Output Formats")]
+    pub line_width: Option<usize>,
+
+    /// Colour nucleotides by base
+    #[arg(
+        long,
+        value_enum,
+        value_name = "WHEN",
+        default_value_t = ColorWhen::Auto,
+        help_heading = "Output Formats"
+    )]
+    pub color: ColorWhen,
+
+    /// Print one line about the whole run on standard error
+    #[arg(long, help_heading = "Output Formats")]
+    pub summary: bool,
+}
+
+impl Presentation {
+    /// The rendering these flags ask for, over the one `path` would have detected.
+    pub fn rendering(&self, path: Option<&str>) -> Rendering {
+        let detected = Rendering::for_output(path);
+        Rendering {
+            line_width: self.line_width.unwrap_or(detected.line_width),
+            color: match self.color {
+                ColorWhen::Auto => detected.color,
+                ColorWhen::Always => true,
+                ColorWhen::Never => false,
+            },
+        }
+    }
+}
+
+/// Where the records of a run are written.
+///
+/// A corpus is cleaned file by file and a pipeline wants one stream, so the two are named
+/// apart rather than inferred from how many inputs there happen to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Destination {
+    /// One stream carrying every input, which is what a pipeline reads.
+    Stream(Option<String>),
+    /// One file per input, basename preserved, which is what a corpus keeps.
+    Directory(String),
+    /// Each input rewritten where it lies, once its replacement is whole on disk.
+    InPlace,
+    /// Nothing is written, which is what `--dry-run` and `--quiet` both ask for.
+    Discard,
+}
+
+impl Destination {
+    /// The path whose terminal-ness decides the default rendering, for [`Presentation`].
+    ///
+    /// Only a stream can reach a terminal, so every other destination answers as a file
+    /// would, and `--color always` stays the way to override that.
+    pub fn terminal_path(&self) -> Option<&str> {
+        match self {
+            Destination::Stream(path) => path.as_deref(),
+            _ => Some(""),
+        }
+    }
+
+    /// The one writer every input shares, or `None` when each input needs its own.
+    pub fn shared_writer(&self, rendering: Rendering) -> io::Result<Option<RecordWriter<Sink>>> {
+        match self {
+            Destination::Stream(path) => Ok(Some(RecordWriter::with_rendering(
+                open_output(path.as_deref())?,
+                rendering,
+                SequenceFormat::Fasta,
+            ))),
+            Destination::Discard => Ok(Some(RecordWriter::with_rendering(
+                Box::new(io::sink()),
+                rendering,
+                SequenceFormat::Fasta,
+            ))),
+            Destination::Directory(_) | Destination::InPlace => Ok(None),
+        }
+    }
+
+    /// A writer for `input`, or `None` when the run shares one across all inputs.
+    ///
+    /// The file is created before any record is read, so an input holding no records still
+    /// leaves an empty output beside its siblings rather than a gap.
+    pub fn writer_for(&self, input: &str, rendering: Rendering) -> io::Result<Option<PerInput>> {
+        let path = match self {
+            Destination::Stream(_) | Destination::Discard => return Ok(None),
+            Destination::Directory(directory) => {
+                Path::new(directory).join(named_file(input, self)?)
+            }
+            // The input's own path, not its name: an in-place run replaces the file where it
+            // lies, and taking the name alone would write into the working directory instead.
+            Destination::InPlace => {
+                named_file(input, self)?;
+                PathBuf::from(input)
+            }
+        };
+        if matches!(self, Destination::Directory(_)) && path == Path::new(input) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--output-dir would overwrite the input '{input}'; use --in-place"),
+            ));
+        }
+        // An in-place run writes beside its target and renames, so a run that dies partway
+        // leaves the input intact rather than half-rewritten.
+        let (writing_to, swap_into) = match self {
+            Destination::InPlace => (temporary_beside(&path), Some(path)),
+            _ => (path, None),
+        };
+        Ok(Some(PerInput {
+            writer: RecordWriter::with_rendering(
+                open_output(writing_to.to_str())?,
+                rendering,
+                SequenceFormat::Fasta,
+            ),
+            writing_to,
+            swap_into,
+        }))
+    }
+}
+
+/// The name `input` contributes to its own output, which standard input does not have.
+fn named_file<'a>(input: &'a str, destination: &Destination) -> io::Result<&'a std::ffi::OsStr> {
+    let flag = match destination {
+        Destination::InPlace => "--in-place",
+        _ => "--output-dir",
+    };
+    match input {
+        "-" => None,
+        named => Path::new(named).file_name(),
+    }
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{flag} needs a named input, but '{input}' has no file name"),
+        )
+    })
+}
+
+/// A sibling of `path` that no concurrent run of this tool will also pick.
+fn temporary_beside(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".fasterfasta-{}", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// One input's own writer, plus whatever has to happen once its records are all written.
+pub struct PerInput {
+    writer: RecordWriter<Sink>,
+    writing_to: PathBuf,
+    /// Set for an in-place run: the input this temporary replaces.
+    swap_into: Option<PathBuf>,
+}
+
+impl PerInput {
+    /// The writer itself, which the caller hands records to.
+    pub fn writer_mut(&mut self) -> &mut RecordWriter<Sink> {
+        &mut self.writer
+    }
+
+    /// Flush, and for an in-place run put the finished file where the input was.
+    ///
+    /// A failed rename leaves the temporary behind deliberately: the records are in it, and
+    /// deleting them to tidy up would be the one unrecoverable move.
+    pub fn finish(mut self) -> io::Result<()> {
+        self.writer.flush()?;
+        drop(self.writer);
+        match self.swap_into {
+            Some(target) => std::fs::rename(&self.writing_to, &target),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The writer every record-emitting tool ends up holding, whatever its destination.
+pub type Sink = Box<dyn Write>;
+
 /// Foreground colour for one nucleotide, or `None` to leave it uncoloured.
 fn base_color(base: u8) -> Option<&'static [u8]> {
     match base.to_ascii_uppercase() {
@@ -742,15 +936,41 @@ pub fn open_output(path: Option<&str>) -> io::Result<Box<dyn io::Write>> {
     }
 }
 
-/// The epilogue every tool's `main` shares: a broken pipe is a normal end, because
-/// `tool | head` is a routine way to use these; anything else is fatal.
-pub fn finish_or_exit(context: &str, result: io::Result<()>) {
-    if let Err(error) = result {
-        if error.kind() == io::ErrorKind::BrokenPipe {
-            std::process::exit(0);
+/// What a run produced, which is what its exit code reports.
+///
+/// Named apart from failure because "ran and produced nothing" is a different recovery from
+/// "could not run": the first wants a wider filter, the second wants a fixed command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// At least one record, row, or file was written.
+    Produced,
+    /// The run completed and produced nothing.
+    Empty,
+}
+
+impl RunOutcome {
+    /// [`RunOutcome::Produced`] when `count` is non-zero, which is how every tool decides.
+    pub fn of(count: usize) -> Self {
+        match count {
+            0 => Self::Empty,
+            _ => Self::Produced,
         }
-        eprintln!("{context}: {error}");
-        std::process::exit(1);
+    }
+}
+
+/// The epilogue every tool's `main` shares.
+///
+/// A broken pipe is a normal end rather than a failure, because `tool | head` is a routine
+/// way to use these, and by then the records that mattered are already downstream.
+pub fn finish_or_exit(context: &str, result: io::Result<RunOutcome>) -> ! {
+    match result {
+        Ok(RunOutcome::Produced) => std::process::exit(0),
+        Ok(RunOutcome::Empty) => std::process::exit(1),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(error) => {
+            eprintln!("{context}: {error}");
+            std::process::exit(2)
+        }
     }
 }
 
@@ -1336,6 +1556,32 @@ mod tests {
         assert_eq!(plain.split(|&byte| byte == b'\n').count(), 5);
     }
 
+    /// An in-place run writes beside its target and only swaps once the file is whole.
+    #[test]
+    fn in_place_swaps_only_after_the_records_are_written() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = written(&directory, "reads.fa", b">a\nACGT\n");
+
+        let mut per_input = Destination::InPlace
+            .writer_for(input.to_str().unwrap(), Rendering::PLAIN)
+            .ok()
+            .flatten()
+            .expect("an in-place run writes one file per input");
+        per_input
+            .writer_mut()
+            .write_rendered(b">b\nTGCA\n")
+            .unwrap();
+
+        // Still the original bytes: the replacement exists, but beside the input, not over it.
+        assert_eq!(std::fs::read(&input).unwrap(), b">a\nACGT\n");
+        per_input.finish().unwrap();
+        assert_eq!(std::fs::read(&input).unwrap(), b">b\nTGCA\n");
+
+        // And the temporary is gone, having become the input.
+        let siblings = std::fs::read_dir(directory.path()).unwrap().count();
+        assert_eq!(siblings, 1, "the temporary outlived the rename");
+    }
+
     /// One output stream carries one format, so the first record settles it and a later
     /// disagreement is an error rather than a silently mixed file.
     #[test]
@@ -1356,5 +1602,89 @@ mod tests {
         // The refusal leaves the settled format in place rather than half-applying the second.
         writer.write_parts(b"read0", b"ACGT", b"IIII").unwrap();
         assert_eq!(writer.into_inner(), b"@read0\nACGT\n+\nIIII\n");
+    }
+
+    #[test]
+    fn an_output_directory_keeps_each_input_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = Destination::Directory(directory.path().display().to_string());
+        assert!(destination
+            .writer_for("/corpus/reads.fastq", Rendering::PLAIN)
+            .is_ok());
+        assert!(directory.path().join("reads.fastq").exists());
+    }
+
+    #[test]
+    fn an_output_directory_will_not_overwrite_its_input() {
+        let destination = Destination::Directory(".".to_string());
+        assert!(destination
+            .writer_for("./reads.fastq", Rendering::PLAIN)
+            .is_err());
+    }
+
+    #[test]
+    fn a_per_input_destination_refuses_standard_input() {
+        // Nothing is opened: standard input has no name to give an output file.
+        for destination in [
+            Destination::Directory("elsewhere".to_string()),
+            Destination::InPlace,
+        ] {
+            assert!(destination.writer_for("-", Rendering::PLAIN).is_err());
+        }
+    }
+
+    #[test]
+    fn a_shared_destination_needs_no_per_input_writer() {
+        for destination in [Destination::Stream(None), Destination::Discard] {
+            assert!(destination
+                .writer_for("reads.fq", Rendering::PLAIN)
+                .unwrap()
+                .is_none());
+            assert!(destination
+                .shared_writer(Rendering::PLAIN)
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn only_a_stream_can_reach_a_terminal() {
+        assert_eq!(
+            Destination::Stream(Some("out.fa".to_string())).terminal_path(),
+            Some("out.fa")
+        );
+        assert_eq!(Destination::Stream(None).terminal_path(), None);
+        // Everything else answers as a named file would, so nothing writes an escape sequence
+        // into a directory of outputs or over an input.
+        for destination in [
+            Destination::Directory("out".to_string()),
+            Destination::InPlace,
+            Destination::Discard,
+        ] {
+            assert_eq!(destination.terminal_path(), Some(""));
+        }
+    }
+
+    #[test]
+    fn an_explicit_rendering_overrides_the_detected_one() {
+        let presentation = Presentation {
+            line_width: Some(60),
+            color: ColorWhen::Always,
+            summary: false,
+        };
+        let rendering = presentation.rendering(Some("out.fa"));
+        assert_eq!(rendering.line_width, 60);
+        assert!(rendering.color);
+    }
+
+    #[test]
+    fn a_discarding_run_is_never_coloured_by_detection() {
+        let presentation = Presentation {
+            line_width: None,
+            color: ColorWhen::Auto,
+            summary: false,
+        };
+        let rendering = presentation.rendering(Destination::Discard.terminal_path());
+        assert_eq!(rendering, Rendering::PLAIN);
     }
 }

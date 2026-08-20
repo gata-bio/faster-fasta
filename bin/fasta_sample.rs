@@ -9,17 +9,21 @@
 //! # Examples
 //!
 //! ```bash
-//! fasta-sample sequences.fasta --count 1000 -o sample.fasta
-//! fasta-sample reads.fastq --fraction 0.1 -o tenth.fastq
+//! fasta-sample sequences.fasta --count 1000 --output sample.fasta
+//! fasta-sample reads.fastq --fraction 0.1 --output tenth.fastq
 //! cat reads.fastq | fasta-sample --fraction 0.01 --seed 42 > sample.fastq
 //! ```
+//!
+//! Exit: 0 sampled a record, 1 ran and sampled none, 2 could not run.
 
 use std::collections::BinaryHeap;
 use std::io::{self, Write};
 
 use clap::Parser;
 
-use fasterfasta::files::{finish_or_exit, open_output, RecordWriter, Rendering};
+use fasterfasta::files::{
+    finish_or_exit, open_output, Destination, Presentation, RecordWriter, Rendering, RunOutcome,
+};
 use fasterfasta::records::{digest, Record, RecordKey, SequenceFormat};
 use fasterfasta::scheduling::{for_each_record_in_inputs, Parallelism};
 
@@ -165,30 +169,49 @@ impl<W: Write> Sampler<W> {
 #[command(
     long_about = "Subsample FASTA or FASTQ records.\n--fraction decides each record independently in constant memory.\n--count keeps a uniform reservoir of exactly N records.\nPass --seed to reproduce a sample exactly."
 )]
+// Exactly one way of deciding what to keep.
+#[command(group(clap::ArgGroup::new("selector").required(true)))]
 struct Args {
     /// Input files; '-' or omitted reads standard input
     #[arg(default_value = "-")]
     inputs: Vec<String>,
 
-    /// Output file; '-' or omitted writes standard output
-    #[arg(short, long)]
-    output: Option<String>,
-
     /// Keep exactly this many records, sampled uniformly
-    #[arg(short = 'n', long, conflicts_with = "fraction")]
+    #[arg(long, value_name = "N", group = "selector", help_heading = "Sampling")]
     count: Option<usize>,
 
     /// Keep each record with this probability, between 0.0 and 1.0
-    #[arg(short = 'f', long, conflicts_with = "count")]
+    #[arg(long, value_name = "P", group = "selector", help_heading = "Sampling")]
     fraction: Option<f64>,
 
     /// Seed for reproducible sampling
-    #[arg(short = 's', long, default_value_t = 42)]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 42,
+        help_heading = "Sampling"
+    )]
     seed: u64,
 
-    /// Report how many records were examined and retained, on standard error
-    #[arg(long)]
-    report: bool,
+    /// Output file; '-' or omitted writes standard output
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["dry_run", "quiet"],
+        help_heading = "Output"
+    )]
+    output: Option<String>,
+
+    /// Report what would be written, on standard error, without writing it
+    #[arg(long, conflicts_with = "quiet", help_heading = "Output")]
+    dry_run: bool,
+
+    /// Suppress all output; the exit code carries the answer
+    #[arg(long, help_heading = "Output")]
+    quiet: bool,
+
+    #[command(flatten)]
+    presentation: Presentation,
 
     #[command(flatten)]
     parallelism: Parallelism,
@@ -207,15 +230,25 @@ fn mode_of(count: Option<usize>, fraction: Option<f64>) -> io::Result<Mode> {
         (_, Some(fraction)) => Err(rejected(format!(
             "--fraction must be between 0.0 and 1.0, got {fraction}"
         ))),
+        // Unreachable through the command line, where the `selector` group requires one.
         (None, None) => Err(rejected("pass either --count or --fraction".to_string())),
     }
 }
 
-fn run(args: &Args) -> io::Result<()> {
+fn run(args: &Args) -> io::Result<RunOutcome> {
     let mode = mode_of(args.count, args.fraction)?;
 
-    let rendering = Rendering::for_output(args.output.as_deref());
-    let output = open_output(args.output.as_deref())?;
+    // A reservoir spans every input, so there is no per-input file to write and the only
+    // two destinations are one stream or none at all.
+    let destination = match args.quiet || args.dry_run {
+        true => Destination::Discard,
+        false => Destination::Stream(args.output.clone()),
+    };
+    let rendering = args.presentation.rendering(destination.terminal_path());
+    let output: Box<dyn Write> = match &destination {
+        Destination::Stream(path) => open_output(path.as_deref())?,
+        _ => Box::new(io::sink()),
+    };
     let mut workers = args.parallelism.ordered()?;
     // One sampler per unit of work in flight, each folded into `combined` in input order.
     let mut states = workers.states(|| Sampler::new(Vec::new(), mode, args.seed, rendering));
@@ -229,13 +262,18 @@ fn run(args: &Args) -> io::Result<()> {
         |state| combined.absorb(state),
     )?;
     combined.finish()?;
-    if args.report {
+    if args.dry_run {
+        eprintln!(
+            "would retain {} of {} records; nothing was written",
+            combined.retained, combined.seen
+        );
+    } else if args.presentation.summary {
         eprintln!(
             "examined {} records, retained {}",
             combined.seen, combined.retained
         );
     }
-    Ok(())
+    Ok(RunOutcome::of(combined.retained as usize))
 }
 
 fn main() {
@@ -245,6 +283,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use fasterfasta::scheduling::for_each_record_in_bytes;
 
     fn sample(data: &[u8], mode: Mode, seed: u64) -> String {
@@ -428,5 +467,47 @@ mod tests {
         fraction.finish().unwrap();
         assert_eq!(fraction.seen, 100);
         assert_eq!(fraction.retained, 100);
+    }
+
+    /// Every flag is spelled out, so a call site says what it does and nothing is remembered
+    /// by letter. `-h` and `-V` are clap's own and stay.
+    #[test]
+    fn declares_no_short_flags() {
+        // Built first, because `-h` and `-V` are only added then and they are the exemption.
+        let mut command = Args::command();
+        command.build();
+        assert!(command
+            .get_arguments()
+            .all(|argument| argument.get_short().is_none()
+                || matches!(argument.get_short(), Some('h') | Some('V'))));
+    }
+
+    /// Pins the surface, so adding, renaming, or reordering a flag is a deliberate edit here
+    /// rather than a drift nobody reviews.
+    #[test]
+    fn declares_the_expected_flags() {
+        let mut command = Args::command();
+        command.build();
+        let longs: Vec<_> = command
+            .get_arguments()
+            .filter_map(|argument| argument.get_long())
+            .collect();
+        assert_eq!(
+            longs,
+            [
+                "count",
+                "fraction",
+                "seed",
+                "output",
+                "dry-run",
+                "quiet",
+                "line-width",
+                "color",
+                "summary",
+                "threads",
+                "help",
+                "version"
+            ]
+        );
     }
 }

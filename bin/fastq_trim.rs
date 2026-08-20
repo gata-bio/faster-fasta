@@ -12,10 +12,12 @@
 //! # Examples
 //!
 //! ```bash
-//! fastq-trim reads.fastq -q 20 -t 5 -l 50 -o trimmed.fastq
-//! fastq-trim reads.fastq -f 10 -L 100 -o trimmed.fastq
-//! cat reads.fastq | fastq-trim -q 20 > trimmed.fastq
+//! fastq-trim reads.fastq --trim-below-quality 20 --trim-end 5 --min-length 50 --output trimmed.fastq
+//! fastq-trim reads.fastq --trim-start 10 --truncate-to 100 --output trimmed.fastq
+//! cat reads.fastq | fastq-trim --trim-below-quality 20 > trimmed.fastq
 //! ```
+//!
+//! Exit: 0 kept a record, 1 ran and kept none, 2 could not run.
 
 use std::io::{self, Write};
 use std::ops::Range;
@@ -24,9 +26,11 @@ use clap::Parser;
 
 use stringzilla::sz::{find_byteset, rfind_byteset, Byteset};
 
-use fasterfasta::files::{finish_or_exit, open_output, RecordWriter, Rendering};
+use fasterfasta::files::{
+    finish_or_exit, Destination, Presentation, RecordWriter, Rendering, RunOutcome,
+};
 use fasterfasta::records::{needs_fastq, phred33_to_ascii, Record, SequenceFormat};
-use fasterfasta::scheduling::{for_each_record_in_inputs, Parallelism};
+use fasterfasta::scheduling::{for_each_record_to_destination, Parallelism};
 
 #[derive(Debug, Clone, Copy, Default)]
 struct TrimSettings {
@@ -140,72 +144,112 @@ struct Args {
     #[arg(default_value = "-")]
     inputs: Vec<String>,
 
-    /// Output file; '-' or omitted writes standard output
-    #[arg(short, long)]
-    output: Option<String>,
-
     /// Trim bases below this Phred score from both ends
-    #[arg(short = 'q', long)]
-    quality_cutoff: Option<u8>,
+    #[arg(long, value_name = "PHRED", help_heading = "Trimming")]
+    trim_below_quality: Option<u8>,
 
     /// Bases to remove from the start of every read
-    #[arg(short = 'f', long, default_value_t = 0)]
-    trim_front: usize,
+    #[arg(long, value_name = "N", default_value_t = 0, help_heading = "Trimming")]
+    trim_start: usize,
 
     /// Bases to remove from the end of every read
-    #[arg(short = 't', long, default_value_t = 0)]
-    trim_tail: usize,
+    #[arg(long, value_name = "N", default_value_t = 0, help_heading = "Trimming")]
+    trim_end: usize,
 
     /// Truncate reads longer than this, keeping the leading bases
-    #[arg(short = 'T', long)]
+    #[arg(long, value_name = "N", help_heading = "Trimming")]
     truncate_to: Option<usize>,
 
     /// Drop reads shorter than this after trimming
-    #[arg(short = 'l', long)]
+    #[arg(long, value_name = "N", help_heading = "Trimming")]
     min_length: Option<usize>,
 
-    /// Report how many records were examined, trimmed, and dropped, on standard error
-    #[arg(long)]
-    report: bool,
+    /// Output file; '-' or omitted writes standard output
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["output_dir", "in_place", "dry_run", "quiet"],
+        help_heading = "Output"
+    )]
+    output: Option<String>,
+
+    /// Write one output per input into this directory, keeping each input's file name
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["in_place", "dry_run", "quiet"],
+        help_heading = "Output"
+    )]
+    output_dir: Option<String>,
+
+    /// Rewrite each input, swapping the result in once it is whole on disk
+    #[arg(long, conflicts_with_all = ["dry_run", "quiet"], help_heading = "Output")]
+    in_place: bool,
+
+    /// Report what would be written, on standard error, without writing it
+    #[arg(long, conflicts_with = "quiet", help_heading = "Output")]
+    dry_run: bool,
+
+    /// Suppress all output; the exit code carries the answer
+    #[arg(long, help_heading = "Output")]
+    quiet: bool,
+
+    #[command(flatten)]
+    presentation: Presentation,
 
     #[command(flatten)]
     parallelism: Parallelism,
 }
 
-fn run(args: &Args) -> io::Result<()> {
+fn run(args: &Args) -> io::Result<RunOutcome> {
     let settings = TrimSettings {
-        acceptable_scores: args.quality_cutoff.map(acceptable_scores),
-        trim_front: args.trim_front,
-        trim_tail: args.trim_tail,
+        acceptable_scores: args.trim_below_quality.map(acceptable_scores),
+        trim_front: args.trim_start,
+        trim_tail: args.trim_end,
         maximum_length: args.truncate_to,
         minimum_length: args.min_length,
     };
 
-    let rendering = Rendering::for_output(args.output.as_deref());
-    let mut output = open_output(args.output.as_deref())?;
+    let destination = if args.quiet || args.dry_run {
+        Destination::Discard
+    } else if args.in_place {
+        Destination::InPlace
+    } else if let Some(directory) = &args.output_dir {
+        Destination::Directory(directory.clone())
+    } else {
+        Destination::Stream(args.output.clone())
+    };
+    let rendering = args.presentation.rendering(destination.terminal_path());
     let mut workers = args.parallelism.ordered()?;
     // Each state buffers the records of one unit of work, and `retire` writes that buffer
     // out in turn, so the output is the same bytes however many workers ran.
     let mut states = workers.states(|| Trimmer::new(Vec::new(), settings, rendering));
 
-    for_each_record_in_inputs(
+    for_each_record_to_destination(
         &args.inputs,
+        &destination,
+        rendering,
         &mut workers,
         &mut states,
         Trimmer::push,
-        |state| state.writer.drain_into(&mut output),
+        |state, writer| state.writer.drain_into(writer.inner_mut()),
     )?;
-    output.flush()?;
 
-    if args.report {
-        let examined: usize = states.iter().map(|state| state.examined).sum();
-        let retained: usize = states.iter().map(|state| state.retained).sum();
+    let examined: usize = states.iter().map(|state| state.examined).sum();
+    let retained: usize = states.iter().map(|state| state.retained).sum();
+    if args.dry_run {
+        eprintln!(
+            "would trim {retained} of {examined} records, dropping {} below the minimum length; \
+             nothing was written",
+            examined - retained
+        );
+    } else if args.presentation.summary {
         eprintln!(
             "examined {examined} records, trimmed {retained}, dropped {} below the minimum length",
             examined - retained
         );
     }
-    Ok(())
+    Ok(RunOutcome::of(retained))
 }
 
 fn main() {
@@ -215,6 +259,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use fasterfasta::scheduling::for_each_record_in_bytes;
 
     fn trim(data: &[u8], settings: TrimSettings) -> String {
@@ -354,5 +399,51 @@ mod tests {
         for_each_record_in_bytes(data, &mut trimmer, Trimmer::push).unwrap();
         assert_eq!(trimmer.examined, 2);
         assert_eq!(trimmer.retained, 1);
+    }
+
+    /// Every flag is spelled out, so a call site says what it does and nothing is remembered
+    /// by letter. `-h` and `-V` are clap's own and stay.
+    #[test]
+    fn declares_no_short_flags() {
+        // Built first, because `-h` and `-V` are only added then and they are the exemption.
+        let mut command = Args::command();
+        command.build();
+        assert!(command
+            .get_arguments()
+            .all(|argument| argument.get_short().is_none()
+                || matches!(argument.get_short(), Some('h') | Some('V'))));
+    }
+
+    /// Pins the surface, so adding, renaming, or reordering a flag is a deliberate edit here
+    /// rather than a drift nobody reviews.
+    #[test]
+    fn declares_the_expected_flags() {
+        let mut command = Args::command();
+        command.build();
+        let longs: Vec<_> = command
+            .get_arguments()
+            .filter_map(|argument| argument.get_long())
+            .collect();
+        assert_eq!(
+            longs,
+            [
+                "trim-below-quality",
+                "trim-start",
+                "trim-end",
+                "truncate-to",
+                "min-length",
+                "output",
+                "output-dir",
+                "in-place",
+                "dry-run",
+                "quiet",
+                "line-width",
+                "color",
+                "summary",
+                "threads",
+                "help",
+                "version"
+            ]
+        );
     }
 }

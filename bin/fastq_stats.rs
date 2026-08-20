@@ -16,13 +16,15 @@
 //! fastq-stats reads.fastq --histogram           # length distribution as well
 //! cat reads.fastq | fastq-stats
 //! ```
+//!
+//! Exit: 0 summarized an input, 1 ran and summarized none, 2 could not run.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
 
 use clap::Parser;
 
-use fasterfasta::files::{finish_or_exit, open_output, InputFile};
+use fasterfasta::files::{finish_or_exit, open_output, InputFile, RunOutcome};
 use fasterfasta::records::{phred33_sum, Record, SequenceFormat};
 use fasterfasta::scheduling::{for_each_record_in_input, Parallelism, Workers};
 
@@ -180,25 +182,68 @@ fn write_header(output: &mut impl Write) -> io::Result<()> {
     )
 }
 
-fn write_row(output: &mut impl Write, label: &str, summary: &Summary) -> io::Result<()> {
+fn write_row(
+    output: &mut impl Write,
+    format: Format,
+    label: &str,
+    summary: &Summary,
+) -> io::Result<()> {
     let quality = match summary.mean_quality() {
         Some(mean) => format!("{mean:.2}"),
         None => "-".to_string(),
     };
-    writeln!(
-        output,
-        "{:<28} {:<7} {:>10} {:>14} {:>9} {:>11.2} {:>9} {:>8} {:>7.2} {:>7.2}",
-        label,
-        summary.format_name(),
-        summary.records,
-        summary.bases,
-        summary.minimum(),
-        summary.mean_length(),
-        summary.maximum_length,
-        quality,
-        summary.percentage(summary.gc_count),
-        summary.percentage(summary.n_count),
-    )
+    match format {
+        Format::Table => writeln!(
+            output,
+            "{:<28} {:<7} {:>10} {:>14} {:>9} {:>11.2} {:>9} {:>8} {:>7.2} {:>7.2}",
+            label,
+            summary.format_name(),
+            summary.records,
+            summary.bases,
+            summary.minimum(),
+            summary.mean_length(),
+            summary.maximum_length,
+            quality,
+            summary.percentage(summary.gc_count),
+            summary.percentage(summary.n_count),
+        ),
+        Format::Plain => writeln!(
+            output,
+            "{}\t{}\t{}\t{}\t{}\t{:.2}\t{}\t{}\t{:.2}\t{:.2}",
+            label,
+            summary.format_name(),
+            summary.records,
+            summary.bases,
+            summary.minimum(),
+            summary.mean_length(),
+            summary.maximum_length,
+            quality,
+            summary.percentage(summary.gc_count),
+            summary.percentage(summary.n_count),
+        ),
+        // Quality is null rather than "-" for a FASTA input, so a consumer branches on the
+        // type instead of on a sentinel it has to know about.
+        Format::Json => writeln!(
+            output,
+            concat!(
+                r#"{{"file":"{}","format":"{}","num_seqs":{},"sum_len":{},"min_len":{},"#,
+                r#""avg_len":{:.2},"max_len":{},"mean_q":{},"gc_pct":{:.2},"n_pct":{:.2}}}"#
+            ),
+            label.escape_debug(),
+            summary.format_name(),
+            summary.records,
+            summary.bases,
+            summary.minimum(),
+            summary.mean_length(),
+            summary.maximum_length,
+            match summary.mean_quality() {
+                Some(mean) => format!("{mean:.2}"),
+                None => "null".to_string(),
+            },
+            summary.percentage(summary.gc_count),
+            summary.percentage(summary.n_count),
+        ),
+    }
 }
 
 /// Summarize one input, which may hold no records at all.
@@ -240,28 +285,72 @@ struct Args {
     #[arg(default_value = "-")]
     inputs: Vec<String>,
 
-    /// Output file; '-' or omitted writes standard output
-    #[arg(short, long)]
-    output: Option<String>,
-
     /// Append a row combining every input
-    #[arg(long)]
+    #[arg(long, help_heading = "Columns")]
     total: bool,
 
     /// Show the length distribution across all inputs
-    #[arg(long)]
+    #[arg(long, help_heading = "Columns")]
     histogram: bool,
+
+    /// How rows are rendered
+    #[arg(
+        long,
+        value_enum,
+        value_name = "FORMAT",
+        default_value_t = Format::Table,
+        help_heading = "Output Formats"
+    )]
+    format: Format,
+
+    /// Output file; '-' or omitted writes standard output
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["dry_run", "quiet"],
+        help_heading = "Output"
+    )]
+    output: Option<String>,
+
+    /// Report what would be written, on standard error, without writing it
+    #[arg(long, conflicts_with = "quiet", help_heading = "Output")]
+    dry_run: bool,
+
+    /// Suppress all output; the exit code carries the answer
+    #[arg(long, help_heading = "Output")]
+    quiet: bool,
+
+    /// Print one line about the whole run on standard error
+    #[arg(long, help_heading = "Output Formats")]
+    summary: bool,
 
     #[command(flatten)]
     parallelism: Parallelism,
 }
 
-fn run(args: &Args) -> io::Result<()> {
-    let mut output = open_output(args.output.as_deref())?;
+/// How one summary row is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Format {
+    /// Aligned columns under a header, which is what a terminal reads best.
+    Table,
+    /// One tab-separated row per input, with no header, for `cut` and `awk`.
+    Plain,
+    /// JSON Lines, one object per input, for a pipeline that parses rather than reads.
+    Json,
+}
+
+fn run(args: &Args) -> io::Result<RunOutcome> {
+    let mut output: Box<dyn Write> = match args.quiet || args.dry_run {
+        true => Box::new(io::sink()),
+        false => open_output(args.output.as_deref())?,
+    };
     let mut workers = args.parallelism.unordered()?;
     let mut combined = Summary::new();
+    let mut rows = 0usize;
 
-    write_header(&mut output)?;
+    if args.format == Format::Table {
+        write_header(&mut output)?;
+    }
     for path in &args.inputs {
         let summary = summarize(path, &mut workers)?;
         let label = if path == "-" {
@@ -269,17 +358,32 @@ fn run(args: &Args) -> io::Result<()> {
         } else {
             path.as_str()
         };
-        write_row(&mut output, label, &summary)?;
+        write_row(&mut output, args.format, label, &summary)?;
         combined.merge(&summary);
+        rows += 1;
     }
 
     if args.total && args.inputs.len() > 1 {
-        write_row(&mut output, "(total)", &combined)?;
+        write_row(&mut output, args.format, "(total)", &combined)?;
     }
     if args.histogram {
         write_histogram(&mut output, &combined)?;
     }
-    output.flush()
+    output.flush()?;
+
+    if args.dry_run {
+        eprintln!(
+            "would summarize {rows} inputs, {} records, {} bases; nothing was written",
+            combined.records, combined.bases
+        );
+    } else if args.summary {
+        eprintln!(
+            "summarized {rows} inputs, {} records, {} bases",
+            combined.records, combined.bases
+        );
+    }
+    // Records rather than rows, so an empty input reports empty the way every other tool does.
+    Ok(RunOutcome::of(combined.records as usize))
 }
 
 fn main() {
@@ -289,6 +393,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use fasterfasta::scheduling;
 
     fn summary_of(data: &[u8], format: SequenceFormat) -> Summary {
@@ -305,7 +410,7 @@ mod tests {
     fn row_of(data: &[u8], format: SequenceFormat) -> String {
         let summary = summary_of(data, format);
         let mut out = Vec::new();
-        write_row(&mut out, "x", &summary).unwrap();
+        write_row(&mut out, Format::Table, "x", &summary).unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -420,5 +525,45 @@ mod tests {
         assert_eq!(summary.minimum(), 0);
         assert!(row.contains(" 0 "), "{row}");
         assert!(histogram_of(b"", SequenceFormat::Fasta).is_empty());
+    }
+
+    /// Every flag is spelled out, so a call site says what it does and nothing is remembered
+    /// by letter. `-h` and `-V` are clap's own and stay.
+    #[test]
+    fn declares_no_short_flags() {
+        // Built first, because `-h` and `-V` are only added then and they are the exemption.
+        let mut command = Args::command();
+        command.build();
+        assert!(command
+            .get_arguments()
+            .all(|argument| argument.get_short().is_none()
+                || matches!(argument.get_short(), Some('h') | Some('V'))));
+    }
+
+    /// Pins the surface, so adding, renaming, or reordering a flag is a deliberate edit here
+    /// rather than a drift nobody reviews.
+    #[test]
+    fn declares_the_expected_flags() {
+        let mut command = Args::command();
+        command.build();
+        let longs: Vec<_> = command
+            .get_arguments()
+            .filter_map(|argument| argument.get_long())
+            .collect();
+        assert_eq!(
+            longs,
+            [
+                "total",
+                "histogram",
+                "format",
+                "output",
+                "dry-run",
+                "quiet",
+                "summary",
+                "threads",
+                "help",
+                "version"
+            ]
+        );
     }
 }

@@ -13,7 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use forkunion::{DynamicScheduler, IntoParallelIterator, ThreadPool, Topology};
 
 use crate::blocks::BlockAccess;
-use crate::files::{ForwardAccess, InputFile, RandomAccess, StreamStart};
+use crate::files::{
+    Destination, ForwardAccess, InputFile, PerInput, RandomAccess, RecordWriter, Rendering, Sink,
+    StreamStart,
+};
 use crate::records::{
     first_record_boundary, last_record_boundary, sequence_format, Record, RecordBoundary,
     SequenceFormat,
@@ -57,8 +60,13 @@ pub enum RecordOrder {
 #[derive(clap::Args, Debug, Clone, Copy)]
 pub struct Parallelism {
     /// Worker threads; 1 runs serially, 0 uses one per logical core
-    #[arg(short = 'j', long = "jobs", default_value_t = 1)]
-    pub jobs: usize,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 1,
+        help_heading = "Parallelism"
+    )]
+    pub threads: usize,
 }
 
 impl Parallelism {
@@ -83,7 +91,7 @@ impl Parallelism {
     fn spawn(self, order: RecordOrder) -> io::Result<Workers> {
         let topology = Topology::new()
             .map_err(|error| io::Error::other(format!("cannot read the machine: {error:?}")))?;
-        let threads = match self.jobs {
+        let threads = match self.threads {
             0 => topology.logical_cores_count().max(1),
             asked => asked,
         };
@@ -752,13 +760,7 @@ pub fn for_each_record_in_inputs<T: Send + Sync>(
     visit: impl Fn(&mut T, Record<'_>) -> io::Result<()> + Send + Sync,
     mut retire: impl FnMut(&mut T) -> io::Result<()>,
 ) -> io::Result<()> {
-    if paths.iter().filter(|path| path.as_str() == "-").count() > 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "standard input can only be read once, but '-' was given more than once",
-        ));
-    }
-
+    only_one_standard_input(paths)?;
     let (mut pool, order) = workers.dispatch();
     for path in paths {
         let mut input = InputFile::open(Some(path))?;
@@ -770,6 +772,63 @@ pub fn for_each_record_in_inputs<T: Send + Sync>(
             &visit,
             &mut retire,
         )?;
+    }
+    Ok(())
+}
+
+/// Refuse a run naming standard input more than once, since there is only one to consume.
+fn only_one_standard_input(paths: &[String]) -> io::Result<()> {
+    match paths.iter().filter(|path| path.as_str() == "-").count() {
+        0 | 1 => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "standard input can only be read once, but '-' was given more than once",
+        )),
+    }
+}
+
+/// Run every input through `visit`, retiring each state into whichever writer `destination`
+/// gives that input.
+///
+/// The driver every record-emitting tool uses. One shared stream and one writer per input are
+/// the same loop from here: [`Destination`] answers which, so a tool never branches on it and
+/// `--output`, `--output-dir`, `--in-place`, `--dry-run` and `--quiet` behave alike in all of
+/// them. Inputs are opened one at a time, because a per-input writer has to know which.
+pub fn for_each_record_to_destination<T: Send + Sync>(
+    paths: &[String],
+    destination: &Destination,
+    rendering: Rendering,
+    workers: &mut Workers,
+    states: &mut [T],
+    visit: impl Fn(&mut T, Record<'_>) -> io::Result<()> + Send + Sync,
+    mut retire: impl FnMut(&mut T, &mut RecordWriter<Sink>) -> io::Result<()>,
+) -> io::Result<()> {
+    only_one_standard_input(paths)?;
+    let mut shared = destination.shared_writer(rendering)?;
+    let (mut pool, order) = workers.dispatch();
+
+    for path in paths {
+        let mut per_input = destination.writer_for(path, rendering)?;
+        let writer = shared
+            .as_mut()
+            .or_else(|| per_input.as_mut().map(PerInput::writer_mut))
+            .expect("a run writes to one shared stream or to one writer per input");
+        let mut input = InputFile::open(Some(path))?;
+        in_one_input(
+            &mut input,
+            pool.as_deref_mut(),
+            order,
+            states,
+            &visit,
+            |state| retire(state, writer),
+        )?;
+        if let Some(per_input) = per_input {
+            per_input.finish()?;
+        }
+    }
+
+    if let Some(writer) = shared.as_mut() {
+        writer.flush()?;
     }
     Ok(())
 }
@@ -810,7 +869,7 @@ mod tests {
     #[test]
     fn standard_input_named_twice_is_rejected() {
         let paths = vec!["-".to_string(), "-".to_string()];
-        let mut workers = Parallelism { jobs: 1 }.ordered().unwrap();
+        let mut workers = Parallelism { threads: 1 }.ordered().unwrap();
         let mut states = [()];
         let error =
             for_each_record_in_inputs(&paths, &mut workers, &mut states, |_, _| Ok(()), |_| Ok(()))
@@ -1264,7 +1323,7 @@ mod tests {
         let mut dispatched = Vec::new();
         let mut states = vec![Vec::new()];
         let mut input = stream_of(&data);
-        let mut workers = Parallelism { jobs: 1 }.ordered().unwrap();
+        let mut workers = Parallelism { threads: 1 }.ordered().unwrap();
         for_each_record_in_input(&mut input, &mut workers, &mut states, render, |state| {
             dispatched.extend_from_slice(state);
             state.clear();
@@ -1287,19 +1346,19 @@ mod tests {
 
         // No pool at all, so one state and no indexing question to answer.
         assert_eq!(
-            counted(&Parallelism { jobs: 1 }.ordered().unwrap()),
+            counted(&Parallelism { threads: 1 }.ordered().unwrap()),
             vec![1]
         );
         assert_eq!(
-            counted(&Parallelism { jobs: 1 }.unordered().unwrap()),
+            counted(&Parallelism { threads: 1 }.unordered().unwrap()),
             vec![1]
         );
 
         // Four threads: ordered buffers several units of work per thread so a slow one is stolen
         // rather than idling the pool, unordered needs one accumulator per thread and no more.
         // The literal is `STATES_PER_THREAD`, spelled out so changing the constant is caught.
-        let ordered = counted(&Parallelism { jobs: 4 }.ordered().unwrap());
-        let unordered = counted(&Parallelism { jobs: 4 }.unordered().unwrap());
+        let ordered = counted(&Parallelism { threads: 4 }.ordered().unwrap());
+        let unordered = counted(&Parallelism { threads: 4 }.unordered().unwrap());
         assert_eq!(ordered.len(), 16, "four threads at four states each");
         assert_eq!(unordered.len(), 4, "four threads at one state each");
         assert!(
@@ -1317,11 +1376,11 @@ mod tests {
             many => (many * STATES_PER_THREAD, many),
         };
         assert_eq!(
-            counted(&Parallelism { jobs: 0 }.ordered().unwrap()).len(),
+            counted(&Parallelism { threads: 0 }.ordered().unwrap()).len(),
             expect_ordered
         );
         assert_eq!(
-            counted(&Parallelism { jobs: 0 }.unordered().unwrap()).len(),
+            counted(&Parallelism { threads: 0 }.unordered().unwrap()).len(),
             expect_unordered
         );
     }

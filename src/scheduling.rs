@@ -3,8 +3,8 @@
 //! Never parses — it picks what each worker reads and hands those bytes to
 //! [`crate::files::RandomAccess`] or [`crate::files::ForwardAccess`]. Three access tiers at
 //! two levels of parallelism give six functions, and [`for_each_record_in_input`] is what a
-//! tool's `main` calls to reach the right one. Deduplication schedules its own passes and
-//! depends on nothing here.
+//! tool's `main` calls to reach the right one. A tool whose state spans the whole input folds
+//! it in `retire`, which runs on the calling thread in input order.
 
 use std::io::{self, Read};
 use std::ops::Range;

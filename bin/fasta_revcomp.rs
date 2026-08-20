@@ -18,69 +18,15 @@
 use std::io::{self, Write};
 
 use clap::Parser;
-use stringzilla::sz::{find_byteset, lookup, Byteset};
+use stringzilla::sz::lookup;
 
 use fasterfasta::files::{finish_or_exit, open_output, RecordWriter, Rendering};
-use fasterfasta::records::{Record, SequenceFormat};
+use fasterfasta::records::{Complements, Record, SequenceFormat};
 use fasterfasta::scheduling::{for_each_record_in_inputs, Parallelism};
-
-/// Complement table over the full IUPAC nucleotide alphabet, in both cases.
-///
-/// Anything outside the alphabet maps to itself, so unexpected bytes survive a round trip
-/// rather than being silently rewritten.
-fn complement_table() -> [u8; 256] {
-    let mut table: [u8; 256] = core::array::from_fn(|index| index as u8);
-
-    // Unambiguous bases. Uracil is its own pair with adenine so RNA is an involution:
-    // complementing A back to T instead of U would silently transcribe RNA into DNA.
-    const PAIRS: &[(u8, u8)] = &[
-        (b'A', b'T'),
-        (b'T', b'A'),
-        (b'G', b'C'),
-        (b'C', b'G'),
-        // Ambiguity codes: each maps to the complement of its base set.
-        (b'R', b'Y'), // A/G  -> T/C
-        (b'Y', b'R'),
-        (b'S', b'S'), // G/C is self-complementary
-        (b'W', b'W'), // A/T is self-complementary
-        (b'K', b'M'), // G/T  -> C/A
-        (b'M', b'K'),
-        (b'B', b'V'), // not-A -> not-T
-        (b'V', b'B'),
-        (b'D', b'H'), // not-C -> not-G
-        (b'H', b'D'),
-        (b'N', b'N'),
-    ];
-
-    for &(base, complement) in PAIRS {
-        table[base as usize] = complement;
-        table[base.to_ascii_lowercase() as usize] = complement.to_ascii_lowercase();
-    }
-    table
-}
-
-/// Complement table for RNA, where uracil takes thymine's place.
-///
-/// Chosen per record from whether the sequence contains any `T` or any `U`, so that
-/// reverse complementing is an involution on both alphabets.
-fn rna_complement_table() -> [u8; 256] {
-    let mut table = complement_table();
-    for (base, complement) in [(b'A', b'U'), (b'U', b'A')] {
-        table[base as usize] = complement;
-        table[base.to_ascii_lowercase() as usize] = complement.to_ascii_lowercase();
-    }
-    table
-}
-
-/// Uracil, whose presence without thymine marks a sequence as RNA.
-const URACIL: Byteset = Byteset::from_bytes(b"Uu");
-/// Thymine, whose presence marks a sequence as DNA even alongside uracil.
-const THYMINE: Byteset = Byteset::from_bytes(b"Tt");
 
 struct ReverseComplementer<W: Write> {
     writer: RecordWriter<W>,
-    dna_table: [u8; 256],
-    rna_table: [u8; 256],
+    complements: Complements,
     sequence_scratch: Vec<u8>,
     quality_scratch: Vec<u8>,
     converted: u64,
@@ -90,8 +36,7 @@ impl<W: Write> ReverseComplementer<W> {
     fn new(writer: W, format: SequenceFormat, rendering: Rendering) -> Self {
         Self {
             writer: RecordWriter::with_rendering(writer, rendering, format),
-            dna_table: complement_table(),
-            rna_table: rna_complement_table(),
+            complements: Complements::new(),
             sequence_scratch: Vec::new(),
             quality_scratch: Vec::new(),
             converted: 0,
@@ -113,13 +58,7 @@ impl<W: Write> ReverseComplementer<W> {
         self.writer.adopt(record.format())?;
         // Uracil standing in for thymine means RNA, where adenine must complement back to
         // uracil. Thymine anywhere settles it as DNA.
-        let table = if find_byteset(record.sequence, URACIL).is_some()
-            && find_byteset(record.sequence, THYMINE).is_none()
-        {
-            self.rna_table
-        } else {
-            self.dna_table
-        };
+        let table = *self.complements.table_for(record.sequence);
 
         let complemented = scratch_of(&mut self.sequence_scratch, record.sequence.len());
         lookup(complemented, record.sequence, table);

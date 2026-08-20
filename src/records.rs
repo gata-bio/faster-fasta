@@ -211,40 +211,79 @@ pub enum RecordKey {
     Sequence,
 }
 
-/// Complement table over the full IUPAC nucleotide alphabet, in both cases.
+/// Uracil, whose presence without thymine marks a sequence as RNA.
+const URACIL: Byteset = Byteset::from_bytes(b"Uu");
+
+/// Thymine, whose presence marks a sequence as DNA even alongside uracil.
+const THYMINE: Byteset = Byteset::from_bytes(b"Tt");
+
+/// Complement tables over the full IUPAC nucleotide alphabet, in both cases.
 ///
-/// Anything outside the alphabet maps to itself, so unexpected bytes survive a round trip
-/// rather than being silently rewritten.
-pub fn complement_table() -> [u8; 256] {
-    let mut table: [u8; 256] = core::array::from_fn(|index| index as u8);
+/// Two tables rather than one, because adenine pairs with thymine in DNA and with uracil in
+/// RNA. Folding both into a single table makes reverse complementing stop being an involution
+/// and quietly transcribes one alphabet into the other.
+#[derive(Debug, Clone)]
+pub struct Complements {
+    dna: [u8; 256],
+    rna: [u8; 256],
+}
 
-    // Uracil is its own pair with adenine so RNA is an involution: complementing A back to T
-    // instead of U would silently transcribe RNA into DNA.
-    const PAIRS: &[(u8, u8)] = &[
-        (b'A', b'T'),
-        (b'T', b'A'),
-        (b'U', b'A'),
-        (b'G', b'C'),
-        (b'C', b'G'),
-        // Ambiguity codes: each maps to the complement of its base set.
-        (b'R', b'Y'), // A/G  -> T/C
-        (b'Y', b'R'),
-        (b'S', b'S'), // G/C is self-complementary
-        (b'W', b'W'), // A/T is self-complementary
-        (b'K', b'M'), // G/T  -> C/A
-        (b'M', b'K'),
-        (b'B', b'V'), // not-A -> not-T
-        (b'V', b'B'),
-        (b'D', b'H'), // not-C -> not-G
-        (b'H', b'D'),
-        (b'N', b'N'),
-    ];
-
-    for &(base, complement) in PAIRS {
-        table[base as usize] = complement;
-        table[base.to_ascii_lowercase() as usize] = complement.to_ascii_lowercase();
+impl Default for Complements {
+    fn default() -> Self {
+        Self::new()
     }
-    table
+}
+
+impl Complements {
+    /// Both tables, built once and reused for the life of a run.
+    pub fn new() -> Self {
+        let mut dna: [u8; 256] = core::array::from_fn(|index| index as u8);
+
+        // Anything outside the alphabet maps to itself, so unexpected bytes survive a round
+        // trip rather than being silently rewritten.
+        const PAIRS: &[(u8, u8)] = &[
+            (b'A', b'T'),
+            (b'T', b'A'),
+            (b'G', b'C'),
+            (b'C', b'G'),
+            // Ambiguity codes: each maps to the complement of its base set.
+            (b'R', b'Y'), // A/G  -> T/C
+            (b'Y', b'R'),
+            (b'S', b'S'), // G/C is self-complementary
+            (b'W', b'W'), // A/T is self-complementary
+            (b'K', b'M'), // G/T  -> C/A
+            (b'M', b'K'),
+            (b'B', b'V'), // not-A -> not-T
+            (b'V', b'B'),
+            (b'D', b'H'), // not-C -> not-G
+            (b'H', b'D'),
+            (b'N', b'N'),
+        ];
+
+        for &(base, complement) in PAIRS {
+            dna[base as usize] = complement;
+            dna[base.to_ascii_lowercase() as usize] = complement.to_ascii_lowercase();
+        }
+
+        let mut rna = dna;
+        for (base, complement) in [(b'A', b'U'), (b'U', b'A')] {
+            rna[base as usize] = complement;
+            rna[base.to_ascii_lowercase() as usize] = complement.to_ascii_lowercase();
+        }
+        Self { dna, rna }
+    }
+
+    /// The table matching this sequence's alphabet.
+    ///
+    /// Uracil without thymine marks RNA; everything else, including an empty sequence, is
+    /// complemented as DNA.
+    pub fn table_for(&self, sequence: &[u8]) -> &[u8; 256] {
+        match find_byteset(sequence, URACIL).is_some() && find_byteset(sequence, THYMINE).is_none()
+        {
+            true => &self.rna,
+            false => &self.dna,
+        }
+    }
 }
 
 /// The bytes a record is identified by, borrowed from the record itself.

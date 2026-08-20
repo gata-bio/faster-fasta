@@ -4,7 +4,7 @@
 
 __Faster FASTA__ is a collection of command-line utilities for processing FASTA and FASTQ files, memory-mapped or streamed from external storage or via `stdin`.
 It's a faster SIMD-accelerated alternative to pure Go [`seqkit`](https://github.com/shenwei356/seqkit) and C++ [`fastp`](https://github.com/OpenGene/fastp) tools.
-It's implemented in Rust with [StringZilla](https://github.com/ashvardanian/StringZilla) to provide high-performance functionality with __auto-format detection__, inspecting the header sigil — `@` for FASTQ, `>` for FASTA.
+Built in Rust on [StringZilla](https://github.com/ashvardanian/StringZilla) and [ForkUnion](https://github.com/ashvardanian/ForkUnion), it __puts every core on compressed data at once__, never unpacking an archive to disk or holding one whole in memory.
 
 ## Tools
 
@@ -47,7 +47,7 @@ Survivors that do not fit in RAM need the input split into partitions folded at 
 Small, exact, and unlikely to be your bottleneck, but here so a pipeline need not leave the toolkit.
 
 - `fastq-stats` — length, quality, GC, and N-content summary, with an optional histogram
-- `fastq-to-fasta` — drop quality scores; `--min-quality` filters first and is the only part that requires FASTQ input
+- `fastq-to-fasta` — drop quality scores; `--min-quality` is the only part that requires FASTQ input
 - `fasta-revcomp` — reverse complement over the full IUPAC alphabet, reversing quality alongside sequence
 - `fasta-dna2rna` — transcribe DNA to RNA by rewriting T as U
 
@@ -183,27 +183,34 @@ Error filtering records: No such file or directory (os error 2)
 
 The container decides how much parallelism is available, independently of which tool runs.
 
-| Input                       | Access              | Parallel decode | Decode speed |
-| :-------------------------- | :------------------ | --------------: | -----------: |
-| `.fa`, `.fq`                | byte-addressable    |             yes |     416 MB/s |
-| `.bgz`, `bgzip` output      | block-addressable   |             yes |     207 MB/s |
-| `.xz` written with `-T0`    | block-addressable   |             yes |      56 MB/s |
-| `.zst`                      | forward-only stream |              no |     264 MB/s |
-| `.gz`, plain gzip           | forward-only stream |              no |     222 MB/s |
-| `.xz` written single-thread | forward-only stream |              no |      56 MB/s |
-| `.bz2`                      | forward-only stream |              no |      25 MB/s |
+| Input                       | Access              | 1 thread | 2 threads |  4 threads |      8 threads |
+| :-------------------------- | :------------------ | -------: | --------: | ---------: | -------------: |
+| `.fa`, `.fq`                | byte-addressable    | 432 MB/s |  655 MB/s | 1'194 MB/s | __2'256 MB/s__ |
+| `.bgz`, `bgzip` output      | block-addressable   | 274 MB/s |  432 MB/s |   846 MB/s | __1'692 MB/s__ |
+| `.xz` written with `-T0`    | block-addressable   | 109 MB/s |   91 MB/s |   159 MB/s |       257 MB/s |
+| `.zst`                      | forward-only stream | 286 MB/s |  362 MB/s |   472 MB/s |       549 MB/s |
+| `.gz`, plain gzip           | forward-only stream | 290 MB/s |  362 MB/s |   472 MB/s |       549 MB/s |
+| `.xz` written single-thread | forward-only stream |  88 MB/s |   92 MB/s |    98 MB/s |       101 MB/s |
+| `.bz2`                      | forward-only stream |  32 MB/s |   32 MB/s |    33 MB/s |        33 MB/s |
 
-Speeds are end-to-end `fastq-stats` throughput over a 194 MB FASTQ of 150 bp reads, measured on one core.
+> Measured on a single Intel Xeon Platinum 8468 socket of 8 physical cores, warm page cache, best of three end-to-end `fastq-stats` runs over a 194 MB prefix of real 150 bp Illumina reads.
+> Every later table on this page references a similar setup.
+
+__A `bgzip` file read across cores can outrun plain uncompressed text read on one__, because a compressed file is a fraction of the bytes and the inflate goes wide alongside the parsing.
+Blocks are decoded straight into a worker's parse window, so nothing is staged to disk and nothing ever holds a decompressed copy — resident memory follows the worker count rather than the size of the file.
+
+A forward-only stream gains only a little, since the decode stays serial while just the parsing goes wide.
+`.bz2` gains nothing at all — it is decode-bound at every worker count.
+
 The codec is detected from the bytes rather than the file name, so a `bgzip` file called `.gz` is still read as blocks and a `.fq` that turns out to be gzip still opens.
 
 A plain `.gz` is one continuous deflate stream and decodes on a single core whatever `--threads` says.
-Recompressing with `bgzip` yields independently decodable 64 KB blocks and costs nothing in compression ratio.
-`xz` is the opposite case: slow enough that a single core is the bottleneck, but threaded `xz` already writes a block index, so a large file compressed the way large files usually are can be decoded in parallel without anybody opting in.
+Recompressing with `bgzip` yields independently decodable 64 KB blocks at no cost in ratio.
+`xz` is the opposite case: threaded `xz` already writes a block index, so anything compressed with `-T0` decodes in parallel without anybody opting in.
 
 ### What a Worker Owns
 
-`--threads` sets the worker count, and a worker owns one unit of work whose state fits in memory.
-What that unit is follows from the input shape.
+`--threads` sets the worker count, and the input shape decides what one worker owns:
 
 - A __byte-addressable__ file has no natural grain, so it is cut into byte ranges resynchronized to the next record boundary — which makes splitting one large file and walking a directory of files the same code path.
 - A __block-addressable__ container is already divided, so a worker takes a run of blocks and never has to search for a boundary.
@@ -219,26 +226,36 @@ How those units recombine follows from the memory group:
 
 ### Choosing a Block Size
 
-__A block-addressable input cannot use more workers than it has blocks__, and that is usually the binding constraint rather than the core count.
-Threaded `xz` splits at three times the dictionary — 24 MB at the default preset — so a 194 MB file holds nine blocks and `--threads 16` is slower than `--threads 8`, the extra workers only contending.
-Cutting the same file into 98 blocks changes the picture entirely:
+A worker takes whole blocks, so the block count is a hard ceiling on how wide a container can be read:
 
-| The same 194 MB file, compressed as | 1 thread | 8 threads |   16 threads | Best speedup |
-| :---------------------------------- | -------: | --------: | -----------: | -----------: |
-| 9 blocks, `xz -T0` at its default   |  63 MB/s |  134 MB/s |     111 MB/s |         2.1× |
-| 98 blocks, `xz --block-size=2MiB`   |  46 MB/s |  184 MB/s | __233 MB/s__ |     __5.1×__ |
+```
+workers actually used = min(--threads, blocks in the file)
+```
 
-So if you control how the archive is written and intend to read it back in parallel, set a block size rather than accepting the default:
+That ceiling is set when the archive is written, not when it is read, and the defaults differ by two orders of magnitude:
+
+| Written as                   | Block size | Blocks in 194 MB | 1 thread | 2 threads | 4 threads |      8 threads |
+| :--------------------------- | ---------: | ---------------: | -------: | --------: | --------: | -------------: |
+| `bgzip`                      |      64 KB |        __3'124__ | 274 MB/s |  432 MB/s |  846 MB/s | __1'692 MB/s__ |
+| `xz -T0 --block-size=2MiB`   |       2 MB |               98 |  97 MB/s |  111 MB/s |  211 MB/s |       398 MB/s |
+| `xz -T0`, at its own default |      24 MB |            __9__ | 109 MB/s |   91 MB/s |  159 MB/s |       257 MB/s |
+
+`xz` splits at three times the dictionary size, so at its default a mid-sized file lands in single-digit blocks — and that block count, not `--threads`, is all it will ever occupy.
+It can even come out __slower__ at two workers than at one, when so few blocks divide unevenly and the run waits on whichever worker drew the extra one.
+`bgzip` never runs into this, which is the reason to prefer it for anything you will read back in parallel:
 
 ```bash
-xz -T0 --block-size=2MiB reads.fastq
+bgzip -@ 16 reads.fastq                 # 64 KB blocks, never the constraint
+xz -T0 --block-size=2MiB reads.fastq    # if you need xz's ratio, say so explicitly
 ```
+
+The cost is paid at one thread: smaller blocks give the compressor less context, and only repay that from two workers up.
 
 ## Performance
 
 Benchmark on the shape of file you actually have.
 Every comparison below runs on decompressed input, where the parser is the whole cost — but real archives arrive compressed, and then __the codec sets the ceiling and the parser is nearly free__.
-A tool reading `.xz` spends roughly seven bytes of its time budget on decompression for every one on parsing, which is why the block tiers under Scaling matter more than any parsing win.
+That is why the block tiers under Scaling matter more than any parsing win.
 
 ### Getting the Datasets
 
@@ -295,6 +312,10 @@ hyperfine \
 
 - __Read mapping against a reference index.__
   That is an FM-index and minimizer problem rather than a string-scanning one; use `bwa`, `minimap2`, or `bowtie2`.
+- __Alignment scoring and traceback.__
+  Identity here is settled by comparing bytes, so two reads differing by one base stay two records; recovering the alignment between them is a quadratic dynamic program that belongs on a GPU, which is what [AffineGaps](https://github.com/unum-bio/AffineGaps) is for.
+- __Approximate similarity search and clustering.__
+  Grouping by similarity rather than equality means an index built once and queried at billion-scale, not an ad-hoc pass over a file; [USearch](https://github.com/unum-cloud/USearch) is that index, and exact deduplication is what shrinks a corpus before it goes in.
 - __SAM, BAM, VCF, and GFF.__
   Sequence files only; use `samtools` and `bcftools`.
 - __Assembly and variant calling.__

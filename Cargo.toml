@@ -1,41 +1,41 @@
 [package]
-name = "fasterfasta"
-version = "0.1.0"
-edition = "2021"
 authors = ["Ash Vardanian <1983160+ashvardanian@users.noreply.github.com>"]
-description = "Command-line utilities for processing memory-mapped FASTA and FASTQ files"
-readme = "README.md"
-license = "Apache-2.0"
-keywords = ["bioinformatics", "fasta", "fastq", "cli", "sequence-analysis"]
 categories = ["command-line-utilities", "science"]
+description = "Command-line utilities for processing memory-mapped FASTA and FASTQ files"
+edition = "2021"
+keywords = ["bioinformatics", "fasta", "fastq", "cli", "sequence-analysis"]
+license = "Apache-2.0"
+name = "fasterfasta"
+readme = "README.md"
 repository = "https://github.com/unum-bio/FasterFASTA"
+version = "0.1.0"
 
 [features]
 # The stream codecs are on by default because real datasets ship compressed and a toolkit
 # that cannot open them is a toolkit nobody reaches for. Each is one dependency, so a build
 # that wants none of them turns them off one at a time.
+bzip2 = ["dep:bzip2"]
 default = ["gzip", "zstd", "bzip2", "xz", "lz4"]
 gzip = ["dep:flate2"]
-zstd = ["dep:zstd"]
-bzip2 = ["dep:bzip2"]
-xz = ["dep:lzma-rust2"]
 lz4 = ["dep:lz4_flex"]
+xz = ["dep:lzma-rust2"]
+zstd = ["dep:zstd"]
 
 [dependencies]
-bzip2 = { version = "0.6", optional = true }
-clap = { version = "4.5", features = ["derive"] }
-flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"], optional = true }
+bzip2 = {version = "0.6", optional = true}
+clap = {version = "4.5", features = ["derive"]}
+flate2 = {version = "1.1", default-features = false, features = ["zlib-rs"], optional = true}
 # StringZilla links the same worker pool with `use forkunion as _;`, which re-exports nothing,
 # so the scheduler has to name it directly. Cargo unifies the two into one build.
 forkunion = "3.0.2"
-lz4_flex = { version = "0.14", optional = true }
-lzma-rust2 = { version = "0.18", default-features = false, features = ["std", "xz", "encoder", "optimization"], optional = true }
+lz4_flex = {version = "0.14", optional = true}
+lzma-rust2 = {version = "0.19", default-features = false, features = ["std", "xz", "encoder", "optimization"], optional = true}
 memmap2 = "0.9"
 # Kept ahead of its first use: deduplication and sorting both need a tape of borrowed
 # spans over one payload, and StringZilla already pulls the same crate in.
-stringtape = { path = "../StringTape" }
-stringzilla = { version = "5", features = ["cpus"] }
-zstd = { version = "0.13", default-features = false, optional = true }
+stringtape = {path = "../StringTape"}
+stringzilla = {version = "5", features = ["cpus"]}
+zstd = {version = "0.13", default-features = false, optional = true}
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -55,8 +55,8 @@ needless_pass_by_value = "warn"
 uninlined_format_args = "warn"
 
 [profile.release]
-lto = true
 codegen-units = 1
+lto = true
 opt-level = 3
 strip = true
 
@@ -91,4 +91,3 @@ path = "bin/fastq_stats.rs"
 [[bin]]
 name = "fastq-to-fasta"
 path = "bin/fastq_to_fasta.rs"
-

@@ -123,7 +123,7 @@ assert_commit_msg_accepts() {
     fi
 }
 
-# Check 1: banner-style comment separators.
+# Banner-style comment separators.
 fixture=$(new_fixture)
 {
     printf '%s\n' '// ===== Records =====' 'pub const WIDTH: usize = 4;' ''
@@ -131,7 +131,7 @@ fixture=$(new_fixture)
 } >"$fixture/src/banner.rs"
 assert_precommit_rejects "banner separator is rejected" "$fixture" "banner-style comment separators"
 
-# Check 2: unbalanced and misnamed region markers.
+# Unbalanced and misnamed region markers.
 fixture=$(new_fixture)
 {
     printf '%s\n' '// region: Records' 'pub const WIDTH: usize = 4;' ''
@@ -153,7 +153,7 @@ fixture=$(new_fixture)
 } >"$fixture/src/orphan.rs"
 assert_precommit_rejects "orphan endregion is rejected" "$fixture" "never opened"
 
-# Check 3: module declarations outside the crate root. Any module may become a facade, so the
+# Module declarations outside the crate root. Any module may become a facade, so the
 # rule is not keyed to one filename.
 for module in records files scheduling; do
     fixture=$(new_fixture)
@@ -174,7 +174,23 @@ printf '%s\n' 'pub mod records;' 'pub mod files;' >"$fixture/src/lib.rs"
 } >"$fixture/src/records.rs"
 assert_precommit_accepts "the crate root may declare modules" "$fixture"
 
-# Check 4: banned project vocabulary.
+# Retired spellings, which the hook turns away so they cannot drift back.
+fixture=$(new_fixture)
+{
+    printf '%s\n' 'pub fn scan(visitor: &mut dyn FnMut()) {}' ''
+    tests_module
+} >"$fixture/src/walker.rs"
+assert_precommit_rejects "a retired spelling is rejected" "$fixture" "a retired spelling"
+
+# A search named next_, which never says which end it starts from.
+fixture=$(new_fixture)
+{
+    printf '%s\n' 'pub fn next_record_boundary(bytes: &[u8]) -> usize { 0 }' ''
+    tests_module
+} >"$fixture/src/seeker.rs"
+assert_precommit_rejects "a search named next_ is rejected" "$fixture" "a search named next_"
+
+# Banned project vocabulary.
 fixture=$(new_fixture)
 printf '%s\n' '# Design' '' 'Each worker owns one shard of the input.' >"$fixture/NOTES.md"
 assert_precommit_rejects "the word shard is rejected" "$fixture" "banned vocabulary"
@@ -260,7 +276,7 @@ else
     failed=$((failed + 1))
 fi
 
-# Check 5: exactly one tests module per Rust source file.
+# Exactly one tests module per Rust source file.
 fixture=$(new_fixture)
 printf '%s\n' 'pub const WIDTH: usize = 4;' >"$fixture/src/untested.rs"
 assert_precommit_rejects "missing tests module is rejected" "$fixture" "exactly one"
@@ -281,7 +297,7 @@ fixture=$(new_fixture)
 } >"$fixture/src/doubled.rs"
 assert_precommit_rejects "duplicate tests module is rejected" "$fixture" "exactly one"
 
-# Check 6: asterisk emphasis in Markdown.
+# Asterisk emphasis in Markdown.
 fixture=$(new_fixture)
 printf '%s\n' '# Design' '' 'The parser is **fast** on every input.' >"$fixture/BOLD.md"
 assert_precommit_rejects "asterisk bold is rejected" "$fixture" "asterisk emphasis"
@@ -290,7 +306,7 @@ fixture=$(new_fixture)
 printf '%s\n' '# Design' '' 'The parser is *fast* on every input.' >"$fixture/ITALIC.md"
 assert_precommit_rejects "asterisk italic is rejected" "$fixture" "asterisk emphasis"
 
-# Check 7: two sentences on one Markdown line.
+# Two sentences on one Markdown line.
 fixture=$(new_fixture)
 printf '%s\n' '# Design' '' 'The parser is fast. It never allocates per record.' >"$fixture/PROSE.md"
 assert_precommit_rejects "two sentences on a line are rejected" "$fixture" "more than one sentence"
@@ -335,6 +351,27 @@ fixture=$(new_fixture)
     tests_module
 } >"$fixture/src/present.rs"
 assert_precommit_accepts "a present-tense comment passes" "$fixture"
+
+# A sentence wrapped at the margin. The lead-in has to be stripped before the lines are joined,
+# or "the previous" and "implementation" stay separated by a "//!" that no pattern spans. Both
+# real occurrences in this tree were of exactly that shape.
+fixture=$(new_fixture)
+{
+    printf '%s\n' '/// Resolves to a range now, unlike the previous' \
+        '/// implementation, which allocated per record.' 'pub const WIDTH: usize = 4;' ''
+    tests_module
+} >"$fixture/src/wrapped.rs"
+assert_precommit_rejects "a wrapped backward-looking sentence is rejected" "$fixture" "backward-looking comment"
+
+# Two comments that merely sit near each other are not one sentence, and joining must not
+# invent a match across the blank line between them.
+fixture=$(new_fixture)
+{
+    printf '%s\n' '/// States the present purpose.' '' '/// Mentions no implementation at all.' \
+        'pub const WIDTH: usize = 4;' ''
+    tests_module
+} >"$fixture/src/adjacent.rs"
+assert_precommit_accepts "adjacent unrelated comments pass" "$fixture"
 
 # Check 9: abbreviated identifiers.
 fixture=$(new_fixture)
@@ -460,11 +497,19 @@ assert_commit_msg_rejects "session link is rejected" \
 
 Claude-Session: https://claude.ai/code/session_1" "tool attributions"
 assert_commit_msg_rejects "unsanctioned verb is rejected" \
-    "Refactor: Split the parser" "four sanctioned verbs"
+    "Refactor: Split the parser" "six sanctioned verbs"
 assert_commit_msg_rejects "missing verb is rejected" \
-    "Split the parser in two" "four sanctioned verbs"
+    "Split the parser in two" "six sanctioned verbs"
 assert_commit_msg_rejects "lowercase word after the verb is rejected" \
-    "Add: streaming reader" "four sanctioned verbs"
+    "Add: streaming reader" "six sanctioned verbs"
+assert_commit_msg_accepts "Docs verb passes" \
+    "Docs: Streaming reader
+
+Prose that drifted on its own, with no code change behind it."
+assert_commit_msg_accepts "Make verb passes" \
+    "Make: Streaming reader
+
+Build and tooling, with no behaviour change behind it."
 assert_commit_msg_accepts "sanctioned verb passes" \
     "Improve: Streaming reader
 

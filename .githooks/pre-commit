@@ -154,6 +154,53 @@ fi
 
 # region Vocabulary
 
+# Spellings the crate has already settled, retired here so they cannot drift back. Each lost a
+# measured count to its winner: `boundary` beats `record start` 55 to 6 for where a record
+# begins, `byte range` beats `extent` 21 to 5, `unit of work` beats `piece of work` 7 to 4, and
+# `visit` beats `visitor` 52 to 1. A block edge is written `block boundary`, always qualified,
+# which is what lets bare `boundary` mean one thing.
+retired=""
+for file in "${staged_files[@]}"; do
+    hits=$(grep -nE '\bRecordStart\b|\bnext_record_start\b|\bextent[s]?\b|piece of work|\bvisitor\b' \
+        -- "$file" 2>/dev/null | sed "s|^|  $file:|" || true)
+    [ -n "$hits" ] && retired+="$hits"$'\n'
+done
+if [ -n "$retired" ]; then
+    fail "$retired" \
+        "a retired spelling; the crate has already chosen the other one." \
+        "RecordStart and next_record_start are RecordBoundary and first_record_boundary;" \
+        "an extent is a byte range; a piece of work is a unit of work; a visitor is a visit."
+fi
+
+# `next_` on a search. Next after what? A search states which end it starts from, so the only
+# directions are `first_` and `last_`.
+directions=""
+for file in "${staged_files[@]}"; do
+    hits=$(grep -nE 'fn next_[a-z_]*(record|block|boundary|range|start)' -- "$file" 2>/dev/null \
+        | sed "s|^|  $file:|" || true)
+    [ -n "$hits" ] && directions+="$hits"$'\n'
+done
+if [ -n "$directions" ]; then
+    fail "$directions" \
+        "a search named next_; say which end it starts from." \
+        "Use first_ or last_, which read the same whether or not the caller has a cursor."
+fi
+
+# `budget` as an identifier. A caller's request is target_bytes and a container's report is
+# decoded_bytes; the word hid that difference across three files. It stays legal in prose,
+# where the point is that a number is consulted and spent.
+budgets=""
+for file in "${staged_files[@]}"; do
+    hits=$(grep -nE '(let|fn|struct|,|:)[[:space:]]*[a-z_]*budget[a-z_]*[[:space:]]*[,:=(]' \
+        -- "$file" 2>/dev/null | sed "s|^|  $file:|" || true)
+    [ -n "$hits" ] && budgets+="$hits"$'\n'
+done
+if [ -n "$budgets" ]; then
+    fail "$budgets" \
+        "budget as an identifier; name which of the two numbers it is." \
+        "target_bytes is what a caller asks for, decoded_bytes is what a container reports."
+fi
+
 # Banned project vocabulary: the word 'shard' in any casing. In a glob of archives, each archive is
 # already an independent piece of work, so the word collides with the name of an input file and
 # every sentence using it becomes ambiguous. The project has four precise words instead:
@@ -242,17 +289,30 @@ for file in "${staged_files[@]}"; do
         *) continue ;;
     esac
     hits=$(awk -v file="$file" '
+        function flush() {
+            if (run != "" && run ~ /(previously|used to|moved from|no longer|was renamed|formerly|previous (implementation|version|design|approach)|the old (implementation|version|code|way)|before this (change|commit)|instead of the old|has been (renamed|replaced|moved))/) {
+                printf "  %s:%d: %s\n", file, run_line, substr(run, 2, 92)
+            }
+            run = ""
+        }
         {
             slashes = index($0, "//")
             block = index($0, "/*")
             start = slashes
             if (block > 0 && (start == 0 || block < start)) start = block
-            if (start == 0) next
-            comment = tolower(substr($0, start))
-            if (comment ~ /(previously|used to|moved from|no longer|was renamed|formerly|previous (implementation|version|design|approach)|the old (implementation|version|code|way)|before this (change|commit)|instead of the old|has been (renamed|replaced|moved))/) {
-                printf "  %s:%d: %s\n", file, NR, $0
-            }
+            if (start == 0) { flush(); next }
+            # Consecutive comment lines are joined before matching. A sentence wrapped at the
+            # margin leaves "The previous" on one line and "implementation" on the next, and a
+            # line-at-a-time pattern sees neither half. The line reported is where the run
+            # opened, which is where a reader starts reading it.
+            if (run == "") run_line = NR
+            # The lead-in is stripped before joining. Leaving it in puts "//!" between the two
+            # halves of a wrapped sentence, so "the previous implementation" never matches.
+            body = tolower(substr($0, start))
+            sub(/^[[:space:]]*(\/\/[\/!]?|\/\*|\*)[[:space:]]*/, "", body)
+            run = run " " body
         }
+        END { flush() }
     ' "$file" 2>/dev/null)
     [ -n "$hits" ] && retrospection+="$hits"$'\n'
 done
@@ -404,7 +464,16 @@ fi
 if [ -f Cargo.toml ] && command -v cargo >/dev/null 2>&1 &&
     printf '%s\n' "${staged_files[@]}" | grep -qE '\.rs$|^Cargo\.toml$'; then
 
-    if ! rustfmt_output=$(cargo fmt --check 2>&1); then
+    # Scoped to the staged Rust files rather than the crate. `cargo fmt --check` reads the whole
+    # working tree, so a partially staged commit is rejected for a file it does not touch, and the
+    # author is sent to fix something they did not write. `rustfmt` takes paths, so it can be told
+    # exactly what this commit is responsible for.
+    staged_rust=()
+    for file in "${staged_files[@]}"; do
+        case "$file" in *.rs) staged_rust+=("$file") ;; esac
+    done
+    if [ "${#staged_rust[@]}" -gt 0 ] &&
+        ! rustfmt_output=$(rustfmt --check --edition 2021 -- "${staged_rust[@]}" 2>&1); then
         rustfmt_diffs=$(printf '%s\n' "$rustfmt_output" | grep -E '^Diff in' | sed 's|^Diff in |  |' | sort -u)
         if [ -n "$rustfmt_diffs" ]; then
             fail "$rustfmt_diffs"$'\n' "rustfmt would change these files." "Run 'cargo fmt'."
@@ -433,8 +502,36 @@ if [ -f Cargo.toml ] && command -v cargo >/dev/null 2>&1 &&
             fail "$(printf '%s\n' "$clippy_output" | head -5)"$'\n' \
                 "cargo clippy could not run." \
                 "This is a toolchain or dependency fault, not a lint; fix it and retry."
+            # A crate that cannot resolve its dependencies cannot be checked under any feature
+            # set either, and reporting that a second time buries the one fault that matters.
+            cargo_usable=no
         fi
     fi
+
+    # Every feature set has to compile, not just the two anyone runs. A variant gated on three
+    # features whose match arm is gated on one builds fine under the default set and under none,
+    # and breaks under exactly the sets nobody checks. Cheap because the codecs share a build:
+    # the first check warms the cache and the rest reuse it.
+    # The list comes from the manifest rather than being written out here, so a codec
+    # added later is covered without anyone remembering to extend this loop, and a crate
+    # declaring no features simply checks the empty set.
+    declared=$(awk '/^\[features\]/ { inside = 1; next }
+                    /^\[/ { inside = 0 }
+                    inside && /^[a-z0-9_-]+[[:space:]]*=/ {
+                        if ($1 != "default") printf "%s ", $1
+                    }' Cargo.toml)
+    [ "${cargo_usable:-yes}" = "yes" ] || declared=""
+    [ "${cargo_usable:-yes}" = "yes" ] && for features in "" $declared; do
+        selected="--no-default-features"
+        [ -n "$features" ] && selected="$selected --features $features"
+        # shellcheck disable=SC2086
+        if ! matrix=$(cargo check --all-targets --quiet $selected 2>&1); then
+            fail "$(printf '%s\n' "$matrix" | grep -E '^error' | head -4)"$'\n' \
+                "cargo check fails with --features ${features:-none}." \
+                "A cfg on a match arm must carry the same predicate as the cfg on its variant."
+            break
+        fi
+    done
 fi
 
 # endregion Toolchain Gates

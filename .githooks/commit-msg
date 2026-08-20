@@ -23,9 +23,11 @@ if [ -n "$attributions" ]; then
     exit 1
 fi
 
-# The subject line. Four verbs cover every commit this project accepts: Fix: for a defect, Add: for
+# The subject line. Six verbs cover every commit this project accepts: Fix: for a defect, Add: for
 # something that did not exist, Improve: for anything that did exist and got better - a refactor
-# included - and Chore: for housekeeping that rearranges or removes without changing behaviour.
+# included - Chore: for housekeeping that rearranges or removes without changing behaviour, Make:
+# for build and tooling, and Docs: for documentation that drifted on its own, such as prose that
+# never followed a rename. A doc change that accompanies code still folds into that commit.
 # A closed set means the log can be skimmed by category, and it forces the author to decide what
 # the commit actually is before writing the body. The word after the verb is uppercase so the
 # subject reads as a sentence. Merge and revert subjects are written by git itself and pass through.
@@ -34,11 +36,12 @@ if [ -n "$subject" ]; then
     case "$subject" in
         Merge* | Revert*) ;;
         *)
-            if ! printf '%s\n' "$subject" | grep -qE '^(Fix|Improve|Add|Chore): [A-Z]'; then
-                echo "commit-msg: the subject line must start with one of the four sanctioned verbs." >&2
+            if ! printf '%s\n' "$subject" | grep -qE '^(Fix|Improve|Add|Chore|Make|Docs): [A-Z]'; then
+                echo "commit-msg: the subject line must start with one of the six sanctioned verbs." >&2
                 echo "  $subject" >&2
                 echo "Write 'Fix: ...' for a defect, 'Add: ...' for something new, 'Improve: ...' for" >&2
-                echo "anything that already existed, 'Chore: ...' for housekeeping - and capitalize the" >&2
+                echo "anything that already existed, 'Chore: ...' for housekeeping, 'Make: ...' for" >&2
+                echo "build and tooling, 'Docs: ...' for prose that drifted - and capitalize the" >&2
                 echo "word that follows the colon." >&2
                 exit 1
             fi

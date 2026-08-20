@@ -8,7 +8,7 @@ readme = "README.md"
 license = "Apache-2.0"
 keywords = ["bioinformatics", "fasta", "fastq", "cli", "sequence-analysis"]
 categories = ["command-line-utilities", "science"]
-repository = "https://github.com/ashvardanian/faster-fasta"
+repository = "https://github.com/unum-bio/FasterFASTA"
 
 [features]
 # The stream codecs are on by default because real datasets ship compressed and a toolkit
